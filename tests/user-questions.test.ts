@@ -161,3 +161,82 @@ describe('user-questions inbound handling', () => {
     expect(pending.size).toBe(0)
   })
 })
+
+import { shouldRouteToRedis, mapQuestionsToOutbound, mapFlinkAnswersToAskAnswer } from '../src/user-questions.js'
+
+describe('user-questions pure helpers', () => {
+  it('routing matrix for titles', () => {
+    expect(shouldRouteToRedis('bot-news')).toBe(true)
+    expect(shouldRouteToRedis('bot-personal-assistant')).toBe(true)
+    expect(shouldRouteToRedis('my-bot-session')).toBe(false)
+    expect(shouldRouteToRedis('Bot-news')).toBe(false)
+    expect(shouldRouteToRedis(undefined)).toBe(false)
+    expect(shouldRouteToRedis('')).toBe(false)
+  })
+
+  it('maps outbound question shapes', () => {
+    const dsq = [{ id: 'q1', question: 'What?', options: [{ label: 'a' }, { label: 'b' }], multiSelect: true }]
+    const out = mapQuestionsToOutbound(dsq as any)
+    expect(out.length).toBe(1)
+    expect(out[0].text).toBe('What?')
+    expect(out[0].options).toEqual(['a','b'])
+    expect(out[0].multi_select).toBe(true)
+
+    const dsq2 = [{ id: 'q2', question: 'Free text' }]
+    const out2 = mapQuestionsToOutbound(dsq2 as any)
+    expect(out2.length).toBe(1)
+    expect(out2[0].text).toBe('Free text')
+    expect(out2[0].options).toBeUndefined()
+    expect(out2[0].multi_select).toBeUndefined()
+  })
+
+  it('maps inbound answers correctly', () => {
+    const single = [{ id: 'q1', value: 'opt1' }]
+    const mappedSingle = mapFlinkAnswersToAskAnswer(single as any)
+    expect(mappedSingle.answers[0].selected).toEqual(['opt1'])
+
+    const multi = [{ id: 'q1', value: ['a','b'] }]
+    const mappedMulti = mapFlinkAnswersToAskAnswer(multi as any)
+    expect(mappedMulti.answers[0].selected).toEqual(['a','b'])
+  })
+})
+
+describe('no-new-turn invariant for question_answer', () => {
+  it('does not start a new turn when handling question_answer', async () => {
+    const transport = new FakeRedisTransport()
+    const bindings = new InMemoryConversationBindingStore()
+    const receipts = new InMemoryReceiptStore({ ttlMs: 60_000 })
+    const state = new InMemoryConversationState()
+    const agents = new FakeAgentRegistry()
+    const ownedHandles = new Set()
+    const logger = { warn: () => {}, error: () => {}, info: () => {} }
+    const pending = new Map<string, any>()
+    const adapter = new InboundAdapter({
+      transport,
+      resolver: { resolve: async () => { throw new Error('not used') } },
+      receipts,
+      bindings,
+      state,
+      ownedHandles,
+      createUserMessage: text => ({ id: `msg-1`, text }),
+      logger,
+      inboundStream: 'harness:inbound',
+      consumerGroup: 'g',
+      consumerName: 'c',
+      pendingQuestions: pending,
+    })
+
+    // register a fake agent and ensure its followup/steer are not invoked
+    const fake = new FakeAgent('session-1')
+    agents.live.set('session-1', fake)
+
+    let resolved = false
+    pending.set('corr-9', { conversationId: 'telegram:chat:1', resolve: (a: any) => { resolved = true }, reject: () => {} })
+
+    const outcome = await adapter.processEntry(makeAnswerEntryWithSession('m9', 'session-1', { correlation_id: 'corr-9', answers: [{ id: 'q1', value: 'x' }] }))
+    expect(outcome.admitted).toBe(true)
+    expect(resolved).toBe(true)
+    expect(fake.followups.length).toBe(0)
+    expect(fake.steers.length).toBe(0)
+  })
+})

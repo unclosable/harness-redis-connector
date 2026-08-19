@@ -26,11 +26,13 @@ import { IoredisRedisTransport, createRedisClient } from './redis-transport/inde
 import { SessionResolver, type AgentHandleLike, type AgentRegistryLike } from './session-resolver/index.js'
 import { InMemoryConversationState } from './state/conversation-state.js'
 import { describeError } from './util.js'
+import type { OutboundEnvelope } from './protocol/types.js'
+import { shouldRouteToRedis, mapQuestionsToOutbound } from './user-questions.js'
 
 export const name = 'harness-redis-connector'
 
 /** The connector creates and drives agents; everything else is carried by the agent composition. */
-export const inject = ['agents']
+export const inject = ['agents', 'userQuestions', 'sessionTitle']
 
 const DEFAULT_INBOUND_STREAM = 'harness:inbound'
 const DEFAULT_OUTBOUND_STREAM = 'harness:outbound'
@@ -187,21 +189,27 @@ export function apply(ctx: Context, config: Config): void {
   // Register a UserQuestion router that routes asks for sessions whose
   // sessionTitle starts with "bot-" to Redis via the outbound stream.
   try {
-    // Obtain typed Cordis services without using `any` casts.
-    const userQuestions = ctx.get('userQuestions') as { registerRouter: (router: UserQuestionRouter) => () => void } | undefined
-    const sessionTitleSvc = ctx.get('sessionTitle') as { get(session: Session): { title?: string } | undefined } | undefined
+    // Obtain typed Cordis services without using `any` casts. Prefer ctx.get but
+    // assert the returned service shapes against the canonical router/service
+    // types imported for type safety.
+    const userQuestions = ctx.get('userQuestions') as unknown as { registerRouter: (router: UserQuestionRouter) => () => void } | undefined
+    const sessionTitleSvc = ctx.get('sessionTitle') as unknown as { get(session: Session): { title?: string } | undefined } | undefined
 
-    const disposer = userQuestions?.registerRouter({
+    if (!userQuestions || !sessionTitleSvc) {
+      logger.error('required services userQuestions or sessionTitle not available')
+      throw new Error('missing required services')
+    }
+
+    const disposer = userQuestions.registerRouter({
       ask: async (request: AskUserQuestionRequest, next: (req: AskUserQuestionRequest) => Promise<AskUserQuestionAnswer>) => {
         // If no agent provided, or no session on the agent, fall through.
-        const agent = request.agent
-        if (agent === undefined) return next(request)
-        const session = (agent as unknown as { session?: Session }).session
-        if (session === undefined) return next(request)
+        const agent = request.agent as unknown as Agent | undefined
+        if (agent == null) return next(request)
+        const session = agent.session
 
-        const titleSnapshot = sessionTitleSvc?.get(session)
+        const titleSnapshot = sessionTitleSvc.get(session)
         const title = titleSnapshot?.title
-        if (title === undefined || !title.startsWith('bot-')) return next(request)
+        if (!shouldRouteToRedis(title)) return next(request)
 
         // Route to Redis: require a conversation binding for this session.
         const sessionId = String(session.id)
@@ -217,10 +225,10 @@ export function apply(ctx: Context, config: Config): void {
           throw err
         }
 
-        // Build envelope payload.
+        // Build envelope payload using the pure mapper.
         const correlationId = randomUUID()
-        const questions = request.questions.map(q => ({ id: q.id, text: q.question, ...(q.options ? { options: q.options.map(o => o.label) } : {}), ...(q.multiSelect ? { multi_select: true } : {}) }))
-        const envelope = {
+        const questions = mapQuestionsToOutbound(request.questions)
+        const envelope: OutboundEnvelope = {
           version: 1,
           conversation_id: conversationId,
           session_id: sessionId,
@@ -249,7 +257,7 @@ export function apply(ctx: Context, config: Config): void {
         })
 
         try {
-          await sender.send(envelope as any)
+          await sender.send(envelope)
         } catch (err) {
           // Remove pending and propagate error.
           if (pendingQuestions.delete(correlationId)) {
@@ -270,7 +278,7 @@ export function apply(ctx: Context, config: Config): void {
 
     // Ensure router is disposed on plugin shutdown and that pending asks are rejected.
     ctx.effect(() => async () => {
-      disposer?.()
+      disposer()
       // Reject and remove all pending questions on shutdown.
       for (const [corr, p] of pendingQuestions.entries()) {
         try { p.reject(new Error('connector shutting down')) } catch {}

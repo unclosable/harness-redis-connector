@@ -50,10 +50,18 @@ export interface InboundEnvelope {
   metadata: Record<string, unknown>
 }
 
+/** One question in an outbound `question_request`. */
+export interface OutboundQuestion {
+  id: string
+  text: string
+  options?: string[]
+  multi_select?: boolean
+}
+
 /** Content for outbound assistant/error messages or a question_request. */
 export type OutboundContent =
   | { text: string }
-  | { questions: { id: string; text: string; options?: string[]; multi_select?: boolean }[] }
+  | { questions: OutboundQuestion[] }
 
 /** An outbound envelope (Harness → Flink). */
 export interface OutboundEnvelope {

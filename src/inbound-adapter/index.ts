@@ -5,6 +5,7 @@ import type { RedisTransport, StreamEntry } from '../redis-transport/types.js'
 import { BindingConflictError, type AgentHandleLike, type SessionResolverLike } from '../session-resolver/index.js'
 import type { ConversationState } from '../state/conversation-state.js'
 import { describeError, sleep, type LoggerLike } from '../util.js'
+import { mapFlinkAnswersToAskAnswer } from '../user-questions.js'
 
 /** Redis Stream entry field carrying the envelope JSON (fixed by PROTOCOL.md). */
 const PAYLOAD_FIELD = 'json'
@@ -188,7 +189,7 @@ export class InboundAdapter {
       // Special-case: question_answer answers do not start agent turns. Handle
       // them here, before session resolution, by resolving the pending ask().
       if (envelope.type === 'question_answer') {
-        const corr = (envelope as any).correlation_id
+        const corr = envelope.correlation_id
         if (corr === undefined || corr === null || typeof corr !== 'string') {
           this.logger.warn(`inbound ${entry.id}: question_answer missing correlation_id`)
           await this.emitError({ conversationId: envelope.conversation_id, messageId: envelope.message_id, text: 'malformed question_answer: missing correlation_id' })
@@ -211,7 +212,7 @@ export class InboundAdapter {
         // If the envelope contains a session_id, ensure it matches the pending sessionId
         // (when the pending record had a sessionId). A mismatch indicates a stale or
         // mis-routed answer and should be acked & dropped without resolving.
-        const envSession = (envelope as any).session_id
+        const envSession = envelope.session_id
         if (envSession !== undefined && envSession !== null && pending.sessionId != null && String(envSession) !== String(pending.sessionId)) {
           this.logger.warn(`inbound ${entry.id}: session mismatch for correlation ${corr} (expected ${String(pending.sessionId)} got ${String(envSession)})`)
           await this.safeAck(entry.id)
@@ -219,13 +220,12 @@ export class InboundAdapter {
         }
 
         // Map answers into AskUserQuestionAnswer shape.
-        const content = envelope.content as any
-        const answersRaw = content.answers as { id: string; value: string | string[] }[]
-        const mapped = answersRaw.map(a => ({ id: a.id, selected: Array.isArray(a.value) ? [...a.value] : [a.value], ...(typeof (a as any).custom === 'string' ? { custom: (a as any).custom } : {}) }))
+        const content = envelope.content as unknown as { answers: { id: string; value: string | string[]; custom?: string }[] }
+        const mappedAnswer = mapFlinkAnswersToAskAnswer(content.answers ?? [])
         // Remove pending atomically and resolve.
         this.pendingQuestions.delete(corr)
         try {
-          pending.resolve({ answers: mapped })
+          pending.resolve(mappedAnswer)
         } catch (err) {
           this.logger.warn(`resolving pending question ${corr} threw: ${String(err)}`)
         }
@@ -237,7 +237,8 @@ export class InboundAdapter {
       const resolved = await this.resolver.resolve(envelope.conversation_id, envelope.session_id, fresh)
       const agent = resolved.agent as DriveAgentLike
       if (resolved.owned && resolved.handle !== undefined) this.ownedHandles.add(resolved.handle)
-      const message = this.createUserMessage((envelope.content as any).text)
+      const contentMessage = envelope.content as { text: string }
+      const message = this.createUserMessage(contentMessage.text)
       if (envelope.type === 'steer') agent.steer(message)
       else agent.followup(message)
       this.state.recordInbound(envelope.conversation_id, envelope.message_id, envelope.metadata)
