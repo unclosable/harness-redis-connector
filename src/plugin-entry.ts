@@ -15,6 +15,7 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { randomUUID } from 'crypto'
 import { SessionId, type Session, type SessionEvent } from '@deepseek-ai/dsh-session'
+import type { UserQuestionRouter, AskUserQuestionRequest, AskUserQuestionAnswer } from '@deepseek-ai/dsh-user-questions'
 import Schema from '@deepseek-ai/schemastery'
 import type {} from '@deepseek-ai/dsh-session-persistence'
 import { RedisConversationBindingStore } from './binding-store/index.js'
@@ -186,59 +187,96 @@ export function apply(ctx: Context, config: Config): void {
   // Register a UserQuestion router that routes asks for sessions whose
   // sessionTitle starts with "bot-" to Redis via the outbound stream.
   try {
-    const disposer = (ctx as any).userQuestions?.registerRouter(async (request: any, next: any) => {
-      // If no agent provided, or no session on the agent, or no sessionTitle,
-      // fall through to the next router/provider once.
-      const agent = request.agent
-      if (agent === undefined) return next(request)
-      const session = (agent as any).session
-      if (session === undefined) return next(request)
+    // Obtain typed Cordis services without using `any` casts.
+    const userQuestions = ctx.get('userQuestions') as { registerRouter: (router: UserQuestionRouter) => () => void } | undefined
+    const sessionTitleSvc = ctx.get('sessionTitle') as { get(session: Session): { title?: string } | undefined } | undefined
 
-      const titleSnapshot = (ctx as any).sessionTitle.get(session)
-      const title = titleSnapshot?.title
-      if (title === undefined || !title.startsWith('bot-')) {
-        return next(request)
-      }
+    const disposer = userQuestions?.registerRouter({
+      ask: async (request: AskUserQuestionRequest, next: (req: AskUserQuestionRequest) => Promise<AskUserQuestionAnswer>) => {
+        // If no agent provided, or no session on the agent, fall through.
+        const agent = request.agent
+        if (agent === undefined) return next(request)
+        const session = (agent as unknown as { session?: Session }).session
+        if (session === undefined) return next(request)
 
-      // Route to Redis: require a conversation binding for this session.
-      const sessionId = String(session.id)
-      const conversationId = await bindings.conversationIdFor(sessionId)
-      if (conversationId === undefined) {
-        const err = new Error(`no conversation bound to session ${sessionId}`)
-        logger.warn(`ask(): ${String(err)}`)
-        throw err
-      }
+        const titleSnapshot = sessionTitleSvc?.get(session)
+        const title = titleSnapshot?.title
+        if (title === undefined || !title.startsWith('bot-')) return next(request)
 
-      // Create correlation id and a pending promise the inbound adapter will
-      // resolve when a matching question_answer arrives.
-      const correlationId = randomUUID()
-      const pendingPromise = new Promise<{ answers: { id: string; selected: string[]; custom?: string }[] }>((resolve, reject) => {
-        pendingQuestions.set(correlationId, { conversationId, sessionId, resolve, reject })
-        // If the request is aborted, remove pending and reject.
-        request.signal?.addEventListener('abort', () => {
-          if (pendingQuestions.delete(correlationId)) reject(new Error('ask aborted'))
-        }, { once: true })
-      })
+        // Route to Redis: require a conversation binding for this session.
+        const sessionId = String(session.id)
+        // Race/abort safety: ensure caller hasn't already aborted.
+        if (request.signal?.aborted) throw new Error('ask aborted')
 
-      // Build question_request envelope and send it.
-      const questions = request.questions.map((q: any) => ({ id: q.id, text: q.question, ...(q.options ? { options: q.options.map((o: any) => o.label) } : {}), ...(q.multiSelect ? { multi_select: true } : {}) }))
-      const envelope = {
-        version: 1,
-        conversation_id: conversationId,
-        session_id: sessionId,
-        correlation_id: correlationId,
-        type: 'question_request',
-        content: { questions },
-        metadata: state.metadataFor(conversationId),
-      }
-      await sender.send(envelope as any)
+        const conversationId = await bindings.conversationIdFor(sessionId)
+        if (request.signal?.aborted) throw new Error('ask aborted')
 
-      // Await the answer or abort.
-      const answer = await pendingPromise
-      return { answers: answer.answers }
+        if (conversationId === undefined) {
+          const err = new Error(`no conversation bound to session ${sessionId}`)
+          logger.warn(`ask(): ${String(err)}`)
+          throw err
+        }
+
+        // Build envelope payload.
+        const correlationId = randomUUID()
+        const questions = request.questions.map(q => ({ id: q.id, text: q.question, ...(q.options ? { options: q.options.map(o => o.label) } : {}), ...(q.multiSelect ? { multi_select: true } : {}) }))
+        const envelope = {
+          version: 1,
+          conversation_id: conversationId,
+          session_id: sessionId,
+          correlation_id: correlationId,
+          type: 'question_request',
+          content: { questions },
+          metadata: state.metadataFor(conversationId),
+        }
+
+        // Create pending entry and attach abort handling. The pending entry must
+        // exist before awaiting responses from the adapter; however, if the
+        // outbound send fails, the pending entry must be removed to avoid leaks.
+        let settled = false
+        const pendingPromise = new Promise<{ answers: { id: string; selected: string[]; custom?: string }[] }>((resolve, reject) => {
+          const onAbort = () => {
+            if (!settled && pendingQuestions.delete(correlationId)) {
+              settled = true
+              reject(new Error('ask aborted'))
+            }
+          }
+          // Insert pending before sending so the inbound adapter can resolve it
+          // if an answer races in immediately after send returns. The abort
+          // listener is attached to remove pending if the request is aborted.
+          pendingQuestions.set(correlationId, { conversationId, sessionId, resolve, reject })
+          request.signal?.addEventListener('abort', onAbort, { once: true })
+        })
+
+        try {
+          await sender.send(envelope as any)
+        } catch (err) {
+          // Remove pending and propagate error.
+          if (pendingQuestions.delete(correlationId)) {
+            settled = true
+          }
+          throw err
+        }
+
+        try {
+          const answer = await pendingPromise
+          return { answers: answer.answers }
+        } finally {
+          // Ensure no leaked pending in any case.
+          pendingQuestions.delete(correlationId)
+        }
+      },
     })
-    // Ensure router is disposed on plugin shutdown.
-    ctx.effect(() => async () => { disposer() }, 'harness-redis-connector.user-questions-dispose')
+
+    // Ensure router is disposed on plugin shutdown and that pending asks are rejected.
+    ctx.effect(() => async () => {
+      disposer?.()
+      // Reject and remove all pending questions on shutdown.
+      for (const [corr, p] of pendingQuestions.entries()) {
+        try { p.reject(new Error('connector shutting down')) } catch {}
+        pendingQuestions.delete(corr)
+      }
+    }, 'harness-redis-connector.user-questions-dispose')
   } catch (err) {
     logger.warn(`user-questions integration not registered: ${String(err)}`)
   }

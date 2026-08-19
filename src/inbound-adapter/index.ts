@@ -208,6 +208,16 @@ export class InboundAdapter {
           await this.safeAck(entry.id)
           return { acked: true, admitted: false, duplicate: false, reason: 'conversation mismatch' }
         }
+        // If the envelope contains a session_id, ensure it matches the pending sessionId
+        // (when the pending record had a sessionId). A mismatch indicates a stale or
+        // mis-routed answer and should be acked & dropped without resolving.
+        const envSession = (envelope as any).session_id
+        if (envSession !== undefined && envSession !== null && pending.sessionId != null && String(envSession) !== String(pending.sessionId)) {
+          this.logger.warn(`inbound ${entry.id}: session mismatch for correlation ${corr} (expected ${String(pending.sessionId)} got ${String(envSession)})`)
+          await this.safeAck(entry.id)
+          return { acked: true, admitted: false, duplicate: false, reason: 'session mismatch' }
+        }
+
         // Map answers into AskUserQuestionAnswer shape.
         const content = envelope.content as any
         const answersRaw = content.answers as { id: string; value: string | string[] }[]
