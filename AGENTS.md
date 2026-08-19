@@ -103,3 +103,9 @@ pnpm --filter harness-redis-connector build
 ```
 
 The same `test`/`typecheck` scripts also run from this directory.
+
+## DSH-core dependency
+
+The connector relies on the local DSH patch that exposes
+`ctx.userQuestions.registerRouter(...)`. See `docs/dsh-integration.md` for the
+exact API and operational notes.

@@ -140,3 +140,21 @@ parsing the `telegram:chat:` prefix of `conversation_id`).
 - Pending-entry recovery (`XPENDING` / `XAUTOCLAIM`) is used for consumer restart.
 - Poison messages (malformed, permanently invalid) are logged and eventually
   acknowledged or parked; a dedicated DLQ is deferred for MVP.
+
+## Approvals (reserved question id)
+
+The connector also uses the interactive question wire to route approvals for
+bot sessions. Approvals are implemented as a special question request with a
+single question id of `"approval"` and two options `"Approve"` / `"Deny"`.
+The external side (Flink/Telegram) should render this request as a confirm
+prompt to the user and emit a `question_answer` with the same `correlation_id`.
+
+Mapping on answer resolution (Harness connector → Flink → Harness reaction):
+- Answer `Approve`  → mapped to resolved approval result `allowed-once`.
+- Answer `Deny`     → mapped to resolved approval result `rejected`.
+- Unknown/timeout/abort/send-failure → `unavailable` / `cancelled` as
+  appropriate (connector will handle lifecycle cleanup and error mapping).
+
+The connector keeps pending registry entries discriminated by kind
+(`question` | `approval`) so approval answers are resolved as approvals and
+question answers as questions.

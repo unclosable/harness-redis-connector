@@ -145,3 +145,16 @@ diagnostic commands, and recovery procedures), see
 - A mismatched explicit `session_id` on a `message`/`steer` is rejected (logged +
   outbound `error`) rather than silently rebinding; a `new_session` always
   rebinds.
+
+## DSH-core dependency
+
+This connector requires a small, local, additive patch to the DeepSeek Harness
+that exposes a `registerRouter` seam on the UserQuestionService. See
+`docs/dsh-integration.md` for the exact API, why it's needed, how the connector
+uses it, and how to detect and recover from breaking changes after a DSH
+upgrade.
+
+## License
+
+License: undecided. This repository does not include a license file. The
+project owner should add a LICENSE file when ready.
