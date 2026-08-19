@@ -35,7 +35,7 @@ import { shouldRouteToRedis, mapQuestionsToOutbound, mapFlinkAnswersToAskAnswer 
 export const name = 'harness-redis-connector'
 
 /** The connector creates and drives agents; everything else is carried by the agent composition. */
-export const inject = ['agents', 'userQuestions', 'sessionTitle']
+export const inject = ['agents', 'userQuestions', 'sessionTitle', 'approval']
 
 const DEFAULT_INBOUND_STREAM = 'harness:inbound'
 const DEFAULT_OUTBOUND_STREAM = 'harness:outbound'
