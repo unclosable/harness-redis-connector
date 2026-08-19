@@ -17,10 +17,8 @@ import { randomUUID } from 'crypto'
 import { SessionId, type Session, type SessionEvent } from '@deepseek-ai/dsh-session'
 import type { UserQuestionRouter, AskUserQuestionRequest, AskUserQuestionAnswer } from '@deepseek-ai/dsh-user-questions'
 
-// Local type aliases for ApprovalRequest/ApprovalOutcome to avoid hard dependency
-// in isolated builds; these mirror @deepseek-ai/dsh-user-approval types.
-export type ApprovalRequest = { agent: Agent; toolName: string; callId?: string; reason?: string; signal?: AbortSignal }
-export type ApprovalOutcome = 'allowed-once' | 'rejected' | 'cancelled' | 'unavailable'
+import type { ApprovalRequest, ApprovalOutcome } from '@deepseek-ai/dsh-user-approval'
+import type {} from '@deepseek-ai/dsh-user-approval'   // Context augmentation: ctx.approval + 'approval/request' event
 import Schema from '@deepseek-ai/schemastery'
 import type {} from '@deepseek-ai/dsh-session-persistence'
 import { RedisConversationBindingStore } from './binding-store/index.js'
@@ -309,21 +307,20 @@ export function apply(ctx: Context, config: Config): void {
 
   // Register an approval handler that wins the waterfall for bot-* sessions.
   try {
-    const approvalSvc = ctx.get('approval') as unknown as { request?: unknown } | undefined
     const sessionTitleSvc = ctx.get('sessionTitle') as unknown as { get(session: Session): { title?: string } | undefined } | undefined
 
-    if (!approvalSvc || !sessionTitleSvc) {
+    if (ctx.approval === undefined || !sessionTitleSvc) {
       logger.warn('approval service or sessionTitle not available; skipping approval routing')
     } else {
-      (ctx as any).on('approval/request', async (req: ApprovalRequest, next: (r: ApprovalRequest) => Promise<ApprovalOutcome>) => {
+      ctx.on('approval/request', async (req: ApprovalRequest, next: () => Promise<ApprovalOutcome>) => {
         // If no agent or session, fall through to Web.
-        const agent = (req.agent as unknown as Agent) ?? undefined
-        if (!agent) return next(req)
+        const agent = req.agent ?? undefined
+        if (!agent) return next()
         const session = agent.session
 
         const titleSnapshot = sessionTitleSvc.get(session)
         const title = titleSnapshot?.title
-        if (!shouldRouteToRedis(title)) return next(req)
+        if (!shouldRouteToRedis(title)) return next()
 
         // Handle abort early.
         if (req.signal?.aborted) return 'cancelled'
