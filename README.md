@@ -156,5 +156,5 @@ upgrade.
 
 ## License
 
-License: undecided. This repository does not include a license file. The
-project owner should add a LICENSE file when ready.
+This project is licensed under the Apache License, Version 2.0. See the
+[LICENSE](./LICENSE) file for the full license text.

@@ -2,7 +2,7 @@
   "name": "harness-redis-connector",
   "version": "0.1.0",
   "description": "DeepSeek Harness plugin bridging Redis Streams to Harness Agents/Sessions in both directions.",
-  "license": "MIT",
+  "license": "Apache-2.0",
   "private": true,
   "type": "module",
   "packageManager": "pnpm@11.7.0",
