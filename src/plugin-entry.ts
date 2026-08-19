@@ -13,6 +13,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
+import { randomUUID } from 'crypto'
 import { SessionId, type Session, type SessionEvent } from '@deepseek-ai/dsh-session'
 import Schema from '@deepseek-ai/schemastery'
 import type {} from '@deepseek-ai/dsh-session-persistence'
@@ -141,6 +142,15 @@ export function apply(ctx: Context, config: Config): void {
     }))
   }
 
+  // Pending question map shared between the inbound adapter and the
+  // UserQuestion router registered below. Keyed by correlation_id.
+  const pendingQuestions = new Map<string, {
+    conversationId: string
+    sessionId?: string | null
+    resolve: (answer: { answers: { id: string; selected: string[]; custom?: string }[] }) => void
+    reject: (err: unknown) => void
+  }>()
+
   const adapter = new InboundAdapter({
     transport,
     resolver,
@@ -156,6 +166,7 @@ export function apply(ctx: Context, config: Config): void {
     batchSize: config.batchSize ?? DEFAULT_BATCH_SIZE,
     blockMs: config.blockMs ?? DEFAULT_BLOCK_MS,
     onError: emitError,
+    pendingQuestions,
   })
 
   // Project durable assistant text and turn errors for bound sessions only.
@@ -171,6 +182,66 @@ export function apply(ctx: Context, config: Config): void {
       logger.warn(`agent error projection failed: ${describeError(err)}`)
     })
   })
+
+  // Register a UserQuestion router that routes asks for sessions whose
+  // sessionTitle starts with "bot-" to Redis via the outbound stream.
+  try {
+    const disposer = (ctx as any).userQuestions?.registerRouter(async (request: any, next: any) => {
+      // If no agent provided, or no session on the agent, or no sessionTitle,
+      // fall through to the next router/provider once.
+      const agent = request.agent
+      if (agent === undefined) return next(request)
+      const session = (agent as any).session
+      if (session === undefined) return next(request)
+
+      const titleSnapshot = (ctx as any).sessionTitle.get(session)
+      const title = titleSnapshot?.title
+      if (title === undefined || !title.startsWith('bot-')) {
+        return next(request)
+      }
+
+      // Route to Redis: require a conversation binding for this session.
+      const sessionId = String(session.id)
+      const conversationId = await bindings.conversationIdFor(sessionId)
+      if (conversationId === undefined) {
+        const err = new Error(`no conversation bound to session ${sessionId}`)
+        logger.warn(`ask(): ${String(err)}`)
+        throw err
+      }
+
+      // Create correlation id and a pending promise the inbound adapter will
+      // resolve when a matching question_answer arrives.
+      const correlationId = randomUUID()
+      const pendingPromise = new Promise<{ answers: { id: string; selected: string[]; custom?: string }[] }>((resolve, reject) => {
+        pendingQuestions.set(correlationId, { conversationId, sessionId, resolve, reject })
+        // If the request is aborted, remove pending and reject.
+        request.signal?.addEventListener('abort', () => {
+          if (pendingQuestions.delete(correlationId)) reject(new Error('ask aborted'))
+        }, { once: true })
+      })
+
+      // Build question_request envelope and send it.
+      const questions = request.questions.map((q: any) => ({ id: q.id, text: q.question, ...(q.options ? { options: q.options.map((o: any) => o.label) } : {}), ...(q.multiSelect ? { multi_select: true } : {}) }))
+      const envelope = {
+        version: 1,
+        conversation_id: conversationId,
+        session_id: sessionId,
+        correlation_id: correlationId,
+        type: 'question_request',
+        content: { questions },
+        metadata: state.metadataFor(conversationId),
+      }
+      await sender.send(envelope as any)
+
+      // Await the answer or abort.
+      const answer = await pendingPromise
+      return { answers: answer.answers }
+    })
+    // Ensure router is disposed on plugin shutdown.
+    ctx.effect(() => async () => { disposer() }, 'harness-redis-connector.user-questions-dispose')
+  } catch (err) {
+    logger.warn(`user-questions integration not registered: ${String(err)}`)
+  }
 
   const controller = new AbortController()
   const loop = adapter.run(controller.signal).catch((error: unknown) => {

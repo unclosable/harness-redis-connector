@@ -56,6 +56,13 @@ export interface InboundAdapterOptions {
   readonly blockMs?: number
   /** Optional outbound error projection for malformed/conflicting messages. */
   readonly onError?: ErrorEmitter
+  /** Optional pending question map managed by the plugin to resolve ask() calls. */
+  readonly pendingQuestions?: Map<string, {
+    conversationId: string
+    sessionId?: string | null
+    resolve: (answer: { answers: { id: string; selected: string[]; custom?: string }[] }) => void
+    reject: (err: unknown) => void
+  }>
 }
 
 /**
@@ -78,6 +85,12 @@ export class InboundAdapter {
   private readonly batchSize: number
   private readonly blockMs: number
   private readonly onError: ErrorEmitter | undefined
+  private readonly pendingQuestions: Map<string, {
+    conversationId: string
+    sessionId?: string | null
+    resolve: (answer: { answers: { id: string; selected: string[]; custom?: string }[] }) => void
+    reject: (err: unknown) => void
+  }>
 
   constructor(options: InboundAdapterOptions) {
     this.transport = options.transport
@@ -93,6 +106,7 @@ export class InboundAdapter {
     this.batchSize = options.batchSize ?? 10
     this.blockMs = options.blockMs ?? 5000
     this.onError = options.onError
+    this.pendingQuestions = options.pendingQuestions ?? new Map()
   }
 
   /**
@@ -171,11 +185,49 @@ export class InboundAdapter {
       return { acked: true, admitted: false, duplicate: true }
     }
     try {
+      // Special-case: question_answer answers do not start agent turns. Handle
+      // them here, before session resolution, by resolving the pending ask().
+      if (envelope.type === 'question_answer') {
+        const corr = (envelope as any).correlation_id
+        if (corr === undefined || corr === null || typeof corr !== 'string') {
+          this.logger.warn(`inbound ${entry.id}: question_answer missing correlation_id`)
+          await this.emitError({ conversationId: envelope.conversation_id, messageId: envelope.message_id, text: 'malformed question_answer: missing correlation_id' })
+          await this.safeAck(entry.id)
+          return { acked: true, admitted: false, duplicate: false, reason: 'missing correlation_id' }
+        }
+        const pending = this.pendingQuestions.get(corr)
+        if (pending === undefined) {
+          this.logger.warn(`inbound ${entry.id}: question_answer for unknown correlation ${corr} — dropping`)
+          await this.safeAck(entry.id)
+          return { acked: true, admitted: false, duplicate: false, reason: 'unknown correlation_id' }
+        }
+        // Validate conversation/session identity matches the pending record.
+        if (pending.conversationId !== envelope.conversation_id) {
+          this.logger.warn(`inbound ${entry.id}: conversation mismatch for correlation ${corr} (expected ${pending.conversationId} got ${envelope.conversation_id})`)
+          // Treat as stale / wrong-target: ack & drop without resolving the pending promise.
+          await this.safeAck(entry.id)
+          return { acked: true, admitted: false, duplicate: false, reason: 'conversation mismatch' }
+        }
+        // Map answers into AskUserQuestionAnswer shape.
+        const content = envelope.content as any
+        const answersRaw = content.answers as { id: string; value: string | string[] }[]
+        const mapped = answersRaw.map(a => ({ id: a.id, selected: Array.isArray(a.value) ? [...a.value] : [a.value], ...(typeof (a as any).custom === 'string' ? { custom: (a as any).custom } : {}) }))
+        // Remove pending atomically and resolve.
+        this.pendingQuestions.delete(corr)
+        try {
+          pending.resolve({ answers: mapped })
+        } catch (err) {
+          this.logger.warn(`resolving pending question ${corr} threw: ${String(err)}`)
+        }
+        await this.safeAck(entry.id)
+        return { acked: true, admitted: true, duplicate: false }
+      }
+
       const fresh = envelope.type === 'new_session'
       const resolved = await this.resolver.resolve(envelope.conversation_id, envelope.session_id, fresh)
       const agent = resolved.agent as DriveAgentLike
       if (resolved.owned && resolved.handle !== undefined) this.ownedHandles.add(resolved.handle)
-      const message = this.createUserMessage(envelope.content.text)
+      const message = this.createUserMessage((envelope.content as any).text)
       if (envelope.type === 'steer') agent.steer(message)
       else agent.followup(message)
       this.state.recordInbound(envelope.conversation_id, envelope.message_id, envelope.metadata)

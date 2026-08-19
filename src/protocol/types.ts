@@ -12,41 +12,48 @@
 export const PROTOCOL_VERSION = 1
 
 /** Known inbound message kinds. An unknown value is forward-compatible, not an error. */
-export const INBOUND_TYPES = ['message', 'new_session', 'steer'] as const
+export const INBOUND_TYPES = ['message', 'new_session', 'steer', 'question_answer'] as const
 
-/** Inbound `type` value: `message` | `new_session` | `steer`. */
+/** Inbound `type` value. */
 export type InboundType = (typeof INBOUND_TYPES)[number]
 
 /** Known outbound message kinds. */
-export const OUTBOUND_TYPES = ['assistant_message', 'error'] as const
+export const OUTBOUND_TYPES = ['assistant_message', 'error', 'question_request'] as const
 
-/** Outbound `type` value: `assistant_message` | `error`. */
+/** Outbound `type` value. */
 export type OutboundType = (typeof OUTBOUND_TYPES)[number]
 
-/** Text content carried by an inbound envelope. */
-export interface InboundContent {
+/** Text content carried by an inbound message envelope. */
+export interface InboundContentMessage {
   /** The message text (the Telegram instruction). */
   text: string
+}
+
+/** Content carried by an inbound question_answer envelope. */
+export interface InboundContentQuestionAnswer {
+  answers: { id: string; value: string | string[] }[]
 }
 
 /**
  * A validated inbound envelope (Flink → Harness).
  * `session_id` is `null` when the sender leaves session routing to the binding.
+ * `correlation_id` is present for answers that correlate to prior requests.
  */
 export interface InboundEnvelope {
   version: number
   conversation_id: string
   session_id: string | null
   message_id: string
+  correlation_id?: string | null
   type: InboundType
-  content: InboundContent
+  content: InboundContentMessage | InboundContentQuestionAnswer
   metadata: Record<string, unknown>
 }
 
-/** Text content carried by an outbound envelope. */
-export interface OutboundContent {
-  text: string
-}
+/** Content for outbound assistant/error messages or a question_request. */
+export type OutboundContent =
+  | { text: string }
+  | { questions: { id: string; text: string; options?: string[]; multi_select?: boolean }[] }
 
 /** An outbound envelope (Harness → Flink). */
 export interface OutboundEnvelope {

@@ -96,4 +96,40 @@ describe('protocol validation', () => {
     expect(parsed['session_id']).toBeNull()
     expect(parsed['correlation_id']).toBeNull()
   })
+
+  it('parses a question_answer envelope', () => {
+    const raw = JSON.stringify({
+      version: 1,
+      conversation_id: 'telegram:chat:12345',
+      session_id: null,
+      message_id: 'm-1',
+      correlation_id: 'corr-1',
+      type: 'question_answer',
+      content: { answers: [{ id: 'q1', value: ['a','b'] }] },
+      metadata: {},
+    })
+    const result = parseInboundEnvelope(raw)
+    expect(result.kind).toBe('ok')
+    if (result.kind === 'ok') {
+      expect(result.envelope.type).toBe('question_answer')
+      const content: any = result.envelope.content
+      expect(Array.isArray((content).answers)).toBe(true)
+      expect((content).answers[0].id).toBe('q1')
+    }
+  })
+
+  it('serializes a question_request outbound envelope', () => {
+    const envelope: OutboundEnvelope = {
+      version: 1,
+      conversation_id: 'telegram:chat:12345',
+      session_id: 'sess-1',
+      correlation_id: 'corr-1',
+      type: 'question_request' as any,
+      content: { questions: [{ id: 'q1', text: 'Pick', options: ['a','b'], multi_select: false }] } as any,
+      metadata: {},
+    }
+    const parsed = JSON.parse(serializeOutboundEnvelope(envelope)) as Record<string, unknown>
+    expect(parsed.type).toBe('question_request')
+    expect(Array.isArray((parsed.content as any).questions)).toBe(true)
+  })
 })

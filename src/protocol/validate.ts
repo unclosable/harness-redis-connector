@@ -45,6 +45,7 @@ export function parseInboundEnvelope(raw: string): InboundParseResult {
   const conversation_id = record['conversation_id']
   const message_id = record['message_id']
   const session_id = record['session_id']
+  const correlation_id = record['correlation_id']
   const content = record['content']
   const metadata = record['metadata']
 
@@ -57,14 +58,39 @@ export function parseInboundEnvelope(raw: string): InboundParseResult {
   if (session_id !== null && typeof session_id !== 'string') {
     return { kind: 'error', reason: 'session_id must be a string or null' }
   }
-  if (
-    typeof content !== 'object'
-    || content === null
-    || Array.isArray(content)
-    || typeof (content as Record<string, unknown>)['text'] !== 'string'
-  ) {
-    return { kind: 'error', reason: 'content.text must be a string' }
+  if (correlation_id !== undefined && correlation_id !== null && typeof correlation_id !== 'string') {
+    return { kind: 'error', reason: 'correlation_id must be a string or null' }
   }
+
+  // Type-specific content validation.
+  if (type === 'question_answer') {
+    if (typeof content !== 'object' || content === null || Array.isArray(content)) {
+      return { kind: 'error', reason: 'content must be an object for question_answer' }
+    }
+    const answers = (content as Record<string, unknown>)['answers']
+    if (!Array.isArray(answers) || answers.length === 0) {
+      return { kind: 'error', reason: 'content.answers must be a non-empty array' }
+    }
+    for (const ans of answers) {
+      if (typeof ans !== 'object' || ans === null || Array.isArray(ans)) return { kind: 'error', reason: 'each answer must be an object' }
+      const id = (ans as Record<string, unknown>)['id']
+      const value = (ans as Record<string, unknown>)['value']
+      if (typeof id !== 'string' || id.length === 0) return { kind: 'error', reason: 'answer.id must be a non-empty string' }
+      if (!(typeof value === 'string' || (Array.isArray(value) && value.every(v => typeof v === 'string')))) {
+        return { kind: 'error', reason: 'answer.value must be a string or array of strings' }
+      }
+    }
+  } else {
+    if (
+      typeof content !== 'object'
+      || content === null
+      || Array.isArray(content)
+      || typeof (content as Record<string, unknown>)['text'] !== 'string'
+    ) {
+      return { kind: 'error', reason: 'content.text must be a string' }
+    }
+  }
+
   if (metadata !== undefined && (typeof metadata !== 'object' || metadata === null || Array.isArray(metadata))) {
     return { kind: 'error', reason: 'metadata must be an object' }
   }
@@ -76,8 +102,11 @@ export function parseInboundEnvelope(raw: string): InboundParseResult {
       conversation_id,
       session_id: session_id === null ? null : (session_id as string),
       message_id,
+      correlation_id: correlation_id === undefined ? undefined : (correlation_id === null ? null : String(correlation_id)),
       type: type as InboundType,
-      content: { text: (content as Record<string, unknown>)['text'] as string },
+      content: type === 'question_answer'
+        ? ({ answers: (content as Record<string, unknown>)['answers'] as { id: string; value: string | string[] }[] })
+        : ({ text: (content as Record<string, unknown>)['text'] as string }),
       metadata: (metadata ?? {}) as Record<string, unknown>,
     },
   }
