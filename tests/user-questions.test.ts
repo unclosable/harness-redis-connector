@@ -98,7 +98,8 @@ describe('user-questions inbound handling', () => {
 
     expect(outcome.admitted).toBe(true)
     expect(recorded.value).toBeDefined()
-    expect(recorded.value.answers[0].selected).toEqual(['foo'])
+    // pending resolve receives raw Flink answers now
+    expect(recorded.value[0].value).toEqual('foo')
   })
 
   it('duplicate answer for same correlation is ignored', async () => {

@@ -16,6 +16,11 @@ import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { randomUUID } from 'crypto'
 import { SessionId, type Session, type SessionEvent } from '@deepseek-ai/dsh-session'
 import type { UserQuestionRouter, AskUserQuestionRequest, AskUserQuestionAnswer } from '@deepseek-ai/dsh-user-questions'
+
+// Local type aliases for ApprovalRequest/ApprovalOutcome to avoid hard dependency
+// in isolated builds; these mirror @deepseek-ai/dsh-user-approval types.
+export type ApprovalRequest = { agent: Agent; toolName: string; callId?: string; reason?: string; signal?: AbortSignal }
+export type ApprovalOutcome = 'allowed-once' | 'rejected' | 'cancelled' | 'unavailable'
 import Schema from '@deepseek-ai/schemastery'
 import type {} from '@deepseek-ai/dsh-session-persistence'
 import { RedisConversationBindingStore } from './binding-store/index.js'
@@ -27,7 +32,7 @@ import { SessionResolver, type AgentHandleLike, type AgentRegistryLike } from '.
 import { InMemoryConversationState } from './state/conversation-state.js'
 import { describeError } from './util.js'
 import type { OutboundEnvelope } from './protocol/types.js'
-import { shouldRouteToRedis, mapQuestionsToOutbound } from './user-questions.js'
+import { shouldRouteToRedis, mapQuestionsToOutbound, mapFlinkAnswersToAskAnswer } from './user-questions.js'
 
 export const name = 'harness-redis-connector'
 
@@ -150,7 +155,10 @@ export function apply(ctx: Context, config: Config): void {
   const pendingQuestions = new Map<string, {
     conversationId: string
     sessionId?: string | null
-    resolve: (answer: { answers: { id: string; selected: string[]; custom?: string }[] }) => void
+    // kind discriminator: 'question' | 'approval'
+    kind?: 'question' | 'approval'
+    // Resolver receives raw Flink answers: { id, value, custom? }[]; per-kind mapping done by resolver closure.
+    resolve: (answersRaw: { id: string; value: string | string[]; custom?: string }[]) => void
     reject: (err: unknown) => void
   }>()
 
@@ -242,7 +250,7 @@ export function apply(ctx: Context, config: Config): void {
         // exist before awaiting responses from the adapter; however, if the
         // outbound send fails, the pending entry must be removed to avoid leaks.
         let settled = false
-        const pendingPromise = new Promise<{ answers: { id: string; selected: string[]; custom?: string }[] }>((resolve, reject) => {
+        const pendingPromise = new Promise<AskUserQuestionAnswer>((resolve, reject) => {
           const onAbort = () => {
             if (!settled && pendingQuestions.delete(correlationId)) {
               settled = true
@@ -252,7 +260,17 @@ export function apply(ctx: Context, config: Config): void {
           // Insert pending before sending so the inbound adapter can resolve it
           // if an answer races in immediately after send returns. The abort
           // listener is attached to remove pending if the request is aborted.
-          pendingQuestions.set(correlationId, { conversationId, sessionId, resolve, reject })
+          // The pending resolve expects raw Flink answers and maps them to the
+          // AskUserQuestionAnswer shape using the existing mapper.
+          const resolver = (answersRaw: { id: string; value: string | string[]; custom?: string }[]) => {
+            try {
+              const mapped = mapFlinkAnswersToAskAnswer(answersRaw)
+              resolve(mapped)
+            } catch (e) {
+              reject(e)
+            }
+          }
+          pendingQuestions.set(correlationId, { conversationId, sessionId, kind: 'question', resolve: resolver, reject })
           request.signal?.addEventListener('abort', onAbort, { once: true })
         })
 
@@ -268,7 +286,7 @@ export function apply(ctx: Context, config: Config): void {
 
         try {
           const answer = await pendingPromise
-          return { answers: answer.answers }
+          return answer
         } finally {
           // Ensure no leaked pending in any case.
           pendingQuestions.delete(correlationId)
@@ -287,6 +305,89 @@ export function apply(ctx: Context, config: Config): void {
     }, 'harness-redis-connector.user-questions-dispose')
   } catch (err) {
     logger.warn(`user-questions integration not registered: ${String(err)}`)
+  }
+
+  // Register an approval handler that wins the waterfall for bot-* sessions.
+  try {
+    const approvalSvc = ctx.get('approval') as unknown as { request?: unknown } | undefined
+    const sessionTitleSvc = ctx.get('sessionTitle') as unknown as { get(session: Session): { title?: string } | undefined } | undefined
+
+    if (!approvalSvc || !sessionTitleSvc) {
+      logger.warn('approval service or sessionTitle not available; skipping approval routing')
+    } else {
+      (ctx as any).on('approval/request', async (req: ApprovalRequest, next: (r: ApprovalRequest) => Promise<ApprovalOutcome>) => {
+        // If no agent or session, fall through to Web.
+        const agent = (req.agent as unknown as Agent) ?? undefined
+        if (!agent) return next(req)
+        const session = agent.session
+
+        const titleSnapshot = sessionTitleSvc.get(session)
+        const title = titleSnapshot?.title
+        if (!shouldRouteToRedis(title)) return next(req)
+
+        // Handle abort early.
+        if (req.signal?.aborted) return 'cancelled'
+
+        const sessionId = String(session.id)
+        const conversationId = await bindings.conversationIdFor(sessionId)
+        if (conversationId === undefined) {
+          logger.warn(`approval: no conversation bound to session ${sessionId}`)
+          return 'unavailable'
+        }
+
+        const correlationId = randomUUID()
+        const text = `Approve \`${req.toolName}\`?` + (req.reason ? ` — ${req.reason}` : '')
+        const envelope: OutboundEnvelope = {
+          version: 1,
+          conversation_id: conversationId,
+          session_id: sessionId,
+          correlation_id: correlationId,
+          type: 'question_request',
+          content: { questions: [ { id: 'approval', text, options: ['Approve', 'Deny'] } ] },
+          metadata: state.metadataFor(conversationId),
+        }
+
+        let settled = false
+        const pendingPromise = new Promise<ApprovalOutcome>((resolve, reject) => {
+          const onAbort = () => {
+            if (!settled && pendingQuestions.delete(correlationId)) {
+              settled = true
+              resolve('cancelled')
+            }
+          }
+          const resolver = (answersRaw: { id: string; value: string | string[]; custom?: string }[]) => {
+            // Map raw Flink answers to ApprovalOutcome.
+            try {
+              const approvalAns = answersRaw.find(a => a.id === 'approval')
+              const val = approvalAns === undefined ? undefined : (Array.isArray(approvalAns.value) ? approvalAns.value[0] : approvalAns.value)
+              if (val === 'Approve') resolve('allowed-once')
+              else if (val === 'Deny') resolve('rejected')
+              else resolve('unavailable')
+            } catch (e) {
+              reject(e)
+            }
+          }
+          pendingQuestions.set(correlationId, { conversationId, sessionId, kind: 'approval', resolve: resolver, reject })
+          req.signal?.addEventListener('abort', onAbort, { once: true })
+        })
+
+        try {
+          await sender.send(envelope)
+        } catch (err) {
+          if (pendingQuestions.delete(correlationId)) settled = true
+          return 'unavailable'
+        }
+
+        try {
+          const outcome = await pendingPromise
+          return outcome
+        } finally {
+          pendingQuestions.delete(correlationId)
+        }
+      }, { prepend: true })
+    }
+  } catch (err) {
+    logger.warn(`approval routing not registered: ${String(err)}`)
   }
 
   const controller = new AbortController()

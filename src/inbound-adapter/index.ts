@@ -5,7 +5,6 @@ import type { RedisTransport, StreamEntry } from '../redis-transport/types.js'
 import { BindingConflictError, type AgentHandleLike, type SessionResolverLike } from '../session-resolver/index.js'
 import type { ConversationState } from '../state/conversation-state.js'
 import { describeError, sleep, type LoggerLike } from '../util.js'
-import { mapFlinkAnswersToAskAnswer } from '../user-questions.js'
 
 /** Redis Stream entry field carrying the envelope JSON (fixed by PROTOCOL.md). */
 const PAYLOAD_FIELD = 'json'
@@ -41,6 +40,14 @@ export interface ErrorEmitter {
   (details: { conversationId?: string; messageId?: string; text: string }): void | Promise<void>
 }
 
+export type PendingEntry = {
+  conversationId: string
+  sessionId?: string | null
+  // Resolver receives raw Flink answers: { id, value, custom? }[]; connector maps per-kind.
+  resolve: (answersRaw: { id: string; value: string | string[]; custom?: string }[]) => void
+  reject: (err: unknown) => void
+}
+
 export interface InboundAdapterOptions {
   readonly transport: RedisTransport
   readonly resolver: SessionResolverLike
@@ -58,12 +65,7 @@ export interface InboundAdapterOptions {
   /** Optional outbound error projection for malformed/conflicting messages. */
   readonly onError?: ErrorEmitter
   /** Optional pending question map managed by the plugin to resolve ask() calls. */
-  readonly pendingQuestions?: Map<string, {
-    conversationId: string
-    sessionId?: string | null
-    resolve: (answer: { answers: { id: string; selected: string[]; custom?: string }[] }) => void
-    reject: (err: unknown) => void
-  }>
+  readonly pendingQuestions?: Map<string, PendingEntry>
 }
 
 /**
@@ -86,12 +88,7 @@ export class InboundAdapter {
   private readonly batchSize: number
   private readonly blockMs: number
   private readonly onError: ErrorEmitter | undefined
-  private readonly pendingQuestions: Map<string, {
-    conversationId: string
-    sessionId?: string | null
-    resolve: (answer: { answers: { id: string; selected: string[]; custom?: string }[] }) => void
-    reject: (err: unknown) => void
-  }>
+  private readonly pendingQuestions: Map<string, PendingEntry>
 
   constructor(options: InboundAdapterOptions) {
     this.transport = options.transport
@@ -219,15 +216,15 @@ export class InboundAdapter {
           return { acked: true, admitted: false, duplicate: false, reason: 'session mismatch' }
         }
 
-        // Map answers into AskUserQuestionAnswer shape.
+        // Pass raw answers to the pending resolver (connector handles per-kind mapping).
         const content = envelope.content as unknown as { answers: { id: string; value: string | string[]; custom?: string }[] }
-        const mappedAnswer = mapFlinkAnswersToAskAnswer(content.answers ?? [])
-        // Remove pending atomically and resolve.
+        const rawAnswers = content.answers ?? []
+        // Remove pending atomically and resolve using the raw payload.
         this.pendingQuestions.delete(corr)
         try {
-          pending.resolve(mappedAnswer)
+          pending.resolve(rawAnswers)
         } catch (err) {
-          this.logger.warn(`resolving pending question ${corr} threw: ${String(err)}`)
+          this.logger.warn(`resolving pending entry ${corr} threw: ${String(err)}`)
         }
         await this.safeAck(entry.id)
         return { acked: true, admitted: true, duplicate: false }

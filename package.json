@@ -38,6 +38,7 @@
     "@deepseek-ai/dsh-session-persistence": "workspace:^",
     "@deepseek-ai/dsh-user-questions": "workspace:^",
     "@deepseek-ai/dsh-session-title": "workspace:^",
+    "@deepseek-ai/dsh-user-approval": "workspace:^",
     "@types/node": "^22.20.0",
     "typescript": "^6.0.3",
     "vitest": "^4.1.8"
