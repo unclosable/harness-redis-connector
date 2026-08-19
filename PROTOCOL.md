@@ -41,11 +41,29 @@ and `metadata` are objects.
 }
 ```
 
-`type` ∈ `message` | `new_session` | `steer`.
+`type` ∈ `message` | `new_session` | `steer` | `question_answer`.
 
-- `message`     → `agent.followup(...)`
-- `steer`       → `agent.steer(...)`
-- `new_session` → create a fresh Harness Agent/Session and rebind the conversation to it (do NOT delete the prior session).
+- `message`       → `agent.followup(...)`
+- `steer`         → `agent.steer(...)`
+- `new_session`   → create a fresh Harness Agent/Session and rebind the conversation to it (do NOT delete the prior session).
+- `question_answer` → a structured answer to a prior `question_request` (see Outbound). This is NOT a chat message: it resolves a pending `ask()` on the connector side and MUST never start a new turn (do not call `session.prompt`/`followup`/`steer`).
+
+Example `question_answer` (Flink → Harness):
+
+```json
+{
+  "version": 1,
+  "type": "question_answer",
+  "correlation_id": "b2f5e8c6-...",
+  "conversation_id": "telegram:chat:12345",
+  "session_id": "harness-session-id",
+  "message_id": "telegram-callback-42",
+  "content": { "answers": [{ "id": "q1", "value": "选项A" }] },
+  "metadata": {}
+}
+```
+
+`content.answers` is an array of { id, value } objects. `value` is a string for single-select answers and a string[] for multi-select answers.
 
 ### Outbound (Harness → Flink)
 
@@ -61,7 +79,31 @@ and `metadata` are objects.
 }
 ```
 
-`type` ∈ `assistant_message` | `error`.
+`type` ∈ `assistant_message` | `error` | `question_request`.
+
+- `assistant_message` → normal assistant output.
+- `error`             → error routing/processing info.
+- `question_request`  → request that the external side render a question to the user and return a `question_answer` (see Inbound).
+
+Example `question_request` (Harness → Flink):
+
+```json
+{
+  "version": 1,
+  "type": "question_request",
+  "correlation_id": "b2f5e8c6-...",
+  "conversation_id": "telegram:chat:12345",
+  "session_id": "harness-session-id",
+  "content": {
+    "questions": [
+      { "id": "q1", "text": "Which option?", "options": ["A","B"], "multi_select": false }
+    ]
+  },
+  "metadata": {}
+}
+```
+
+`content.questions` is an array of { id, text, options?: string[], multi_select?: boolean }. Option-less questions are free-text prompts; `options` are label strings and `multi_select` (optional) enables multi-select (single-select default). `correlation_id` is an opaque UUID chosen by the Harness side and echoed back on the `question_answer`.
 
 ## Field semantics (mapping to the existing flink-agents contract)
 

@@ -67,6 +67,31 @@ exactly.
   create/resume; `plugin-entry.ts` tracks owned handles and disposes only those
   on teardown (never an agent it merely reused).
 
+## Interactive questions
+
+The connector registers a user-question router via the DSH `userQuestions` seam:
+`ctx.userQuestions.registerRouter({ ask(request, next) })`.
+
+Routing rule: for each interaction the router reads the originating session's
+title and routes to Redis only if `title.startsWith('bot-')` (exact match on
+prefix). Otherwise the router calls `next(request)` once (Web behavior unchanged).
+
+Redis path and mapping:
+- `conversation_id` is taken from the existing `ConversationBindingStore`.
+- `correlation_id` is generated with `randomUUID()` (opaque, echoed by Flink).
+- DSH questions map into an outbound `question_request` envelope with
+  `content.questions: [{ id, text, options?: string[], multi_select?: boolean }]`.
+- A pending registry entry is kept while waiting for the inbound `question_answer`.
+- Inbound `question_answer` is mapped to `AskUserQuestionAnswer` (`value:string` → `selected:[value]`, `string[]` → `selected`).
+
+Behavioral notes:
+- `question_answer` is dispatched before session resolution and NEVER calls
+  `session.prompt`/`followup`/`steer` — it resolves the pending `ask()` only.
+
+Dependency: this requires the DSH-core `registerRouter` seam in
+`packages/interaction/user-questions` (local harness patch). Connector `inject`
+must include `['agents','userQuestions','sessionTitle']`.
+
 ## Commands
 
 ```sh
