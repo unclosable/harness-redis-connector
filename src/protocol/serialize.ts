@@ -6,5 +6,6 @@ import type { OutboundEnvelope } from './types.js'
  * @returns the JSON string to XADD as the entry payload.
  */
 export function serializeOutboundEnvelope(envelope: OutboundEnvelope): string {
-  return JSON.stringify(envelope)
+  const { contentType, ...wire } = envelope
+  return JSON.stringify(contentType === undefined ? wire : { ...wire, content_type: contentType })
 }

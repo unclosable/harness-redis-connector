@@ -97,6 +97,17 @@ describe('protocol validation', () => {
     expect(parsed['correlation_id']).toBeNull()
   })
 
+  it('serializes promoted markdown content with its snake_case wire field', () => {
+    const envelope: OutboundEnvelope = {
+      version: 1, conversation_id: 'telegram:chat:12345', session_id: 's1', correlation_id: null,
+      type: 'assistant_message', contentType: 'text/markdown', content: '**done**', metadata: {},
+    }
+    const parsed = JSON.parse(serializeOutboundEnvelope(envelope)) as Record<string, unknown>
+    expect(parsed['content_type']).toBe('text/markdown')
+    expect(parsed['content']).toBe('**done**')
+    expect(parsed).not.toHaveProperty('contentType')
+  })
+
   it('parses a question_answer envelope', () => {
     const raw = JSON.stringify({
       version: 1,

@@ -26,7 +26,8 @@ export function buildAssistantEnvelope(args: AssistantEnvelopeArgs): OutboundEnv
     session_id: args.sessionId,
     correlation_id: args.correlationId ?? null,
     type: 'assistant_message',
-    content: { text: args.text },
+    contentType: 'text/markdown',
+    content: args.text,
     metadata: args.metadata,
   }
 }

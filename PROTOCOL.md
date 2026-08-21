@@ -24,8 +24,9 @@ envelope JSON string. The canonical field name is **`json`**: producers write
 `XADD <stream> * json <envelope-json>`. Consumers read the `json` field and MAY
 fall back to the first (only) field value for tolerance.
 
-Field names inside the envelope are snake_case at the envelope level. `content`
-and `metadata` are objects.
+Field names inside the envelope are snake_case at the envelope level. `metadata`
+is an object; `content` is normally an object, with the outbound markdown form
+below as an additive exception.
 
 ### Inbound (Flink → Harness)
 
@@ -84,6 +85,11 @@ Example `question_answer` (Flink → Harness):
 - `assistant_message` → normal assistant output.
 - `error`             → error routing/processing info.
 - `question_request`  → request that the external side render a question to the user and return a `question_answer` (see Inbound).
+
+`assistant_message` may add top-level `content_type: "text/markdown"` and use a
+plain string `content` (rather than `{ "text": "..." }`). This is additive at
+version 1: legacy object-shaped content remains accepted. The Flink bridge
+converts its supported CommonMark subset to Telegram MarkdownV2.
 
 Example `question_request` (Harness → Flink):
 

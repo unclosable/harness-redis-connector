@@ -66,7 +66,8 @@ describe('outbound projector', () => {
       session_id: 'session-1',
       correlation_id: 'telegram-update-1001',
     })
-    expect(lastPayload(transport).content).toEqual({ text: 'hello' })
+    expect(lastPayload(transport).content_type).toBe('text/markdown')
+    expect(lastPayload(transport).content).toBe('hello')
     expect(lastPayload(transport).metadata).toEqual({ chatId: '1' })
   })
 
@@ -80,7 +81,8 @@ describe('outbound projector', () => {
       { type: 'text', text: 'B' },
     ]))
 
-    expect(lastPayload(transport).content).toEqual({ text: 'AB' })
+    expect(lastPayload(transport).content_type).toBe('text/markdown')
+    expect(lastPayload(transport).content).toBe('AB')
   })
 
   it('ignores sessions that are not bound', async () => {

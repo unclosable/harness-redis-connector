@@ -60,6 +60,7 @@ export interface OutboundQuestion {
 
 /** Content for outbound assistant/error messages or a question_request. */
 export type OutboundContent =
+  | string
   | { text: string }
   | { questions: OutboundQuestion[] }
 
@@ -70,6 +71,8 @@ export interface OutboundEnvelope {
   session_id: string | null
   correlation_id: string | null
   type: OutboundType
+  /** Optional media type promoted to wire field `content_type`. */
+  contentType?: string
   content: OutboundContent
   metadata: Record<string, unknown>
 }
