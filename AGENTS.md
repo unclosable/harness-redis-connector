@@ -22,6 +22,11 @@ exactly.
 - **Plugin form:** function plugin with named exports `name` / `inject` /
   `Config` / `apply`, and no default export. `sessionPersistence` is OPTIONAL:
   read it via `ctx.get('sessionPersistence')`, never list it in `inject`.
+- **Resolve optional Cordis services lazily.** Non-injected services
+  (`sessionPersistence`, `agentPresets`, `workspaceRegistry`) must be resolved
+  with `ctx.get(...)` inside the `create`/`resume` request closures, never once
+  at `apply()` time: a strict lookup returns `undefined` until that service's
+  fiber is ACTIVE.
 - **ESM + NodeNext.** Relative imports use `.js` extensions; the package is
   `"type": "module"`. `verbatimModuleSyntax` is on, so type-only imports are
   always `import type`.
@@ -42,7 +47,10 @@ exactly.
   succeed, or after a permanently-invalid message (malformed, unknown type,
   duplicate, binding conflict) is logged and dropped. Transient admission
   failures stay pending and are retried on the reclaim cadence — never ACKed,
-  and never after the agent produces a response.
+  and never after the agent produces a response. `system_command` is the
+  deliberate exception to generic duplicate ACK behavior: it stores a
+  serialized `system_command_result` before emitting it, then ACKs; duplicate
+  deliveries replay that stored result and never repeat the control transition.
 
 ## Architecture decisions
 
@@ -66,6 +74,16 @@ exactly.
 - **Ownership tracking.** The resolver returns `owned: true` + a handle for
   create/resume; `plugin-entry.ts` tracks owned handles and disposes only those
   on teardown (never an agent it merely reused).
+- **System control commands.** `renew_session` uses `resolver.renew()` (the
+  same fresh create + bind path as `new_session`) without `followup`/`steer` or
+  any LLM turn. It inherits the replaced session's provider, model, maxTokens,
+  cwd, and agent preset from the live registry, else folds
+  `sessionPersistence.load(...)`; titles the replacement `bot-<botId>`; and
+  attaches it to the workspace resolved from its cwd. `resume` likewise restores
+  persisted model/preset configuration so
+  GUI-created sessions survive a web restart. The result-store record is the
+  idempotent external outcome; future commands must reuse its store → emit → ACK
+  ordering.
 
 ## Interactive questions
 

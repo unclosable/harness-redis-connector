@@ -91,4 +91,27 @@ describe('session resolver', () => {
     expect(await bindings.sessionIdFor('telegram:chat:1')).toBe('session-1')
     expect(agents.live.has('session-old')).toBe(true)
   })
+
+  it('renew inherits the existing bound session id while creating and rebinding a fresh session', async () => {
+    const { agents, bindings, resolver } = setup()
+    await bindings.bind('telegram:chat:1', 'session-old')
+
+    const renewed = await resolver.renew('telegram:chat:1')
+
+    expect(renewed.sessionId).toBe('session-1')
+    expect(renewed.handle.agent.id).toBe('session-1')
+    expect(agents.created).toHaveLength(1)
+    expect(agents.created[0]?.sourceSessionId).toBe('session-old')
+    expect(await bindings.sessionIdFor('telegram:chat:1')).toBe('session-1')
+  })
+
+  it('renew without an existing binding passes no source session id', async () => {
+    const { agents, bindings, resolver } = setup()
+
+    await resolver.renew('telegram:chat:1', 'bot-operator')
+
+    expect(agents.created[0]?.title).toBe('bot-operator')
+    expect(agents.created[0]?.sourceSessionId).toBeUndefined()
+    expect(await bindings.sessionIdFor('telegram:chat:1')).toBe('session-1')
+  })
 })

@@ -12,13 +12,13 @@
 export const PROTOCOL_VERSION = 1
 
 /** Known inbound message kinds. An unknown value is forward-compatible, not an error. */
-export const INBOUND_TYPES = ['message', 'new_session', 'steer', 'question_answer'] as const
+export const INBOUND_TYPES = ['message', 'new_session', 'steer', 'question_answer', 'system_command'] as const
 
 /** Inbound `type` value. */
 export type InboundType = (typeof INBOUND_TYPES)[number]
 
 /** Known outbound message kinds. */
-export const OUTBOUND_TYPES = ['assistant_message', 'error', 'question_request'] as const
+export const OUTBOUND_TYPES = ['assistant_message', 'error', 'question_request', 'system_command_result'] as const
 
 /** Outbound `type` value. */
 export type OutboundType = (typeof OUTBOUND_TYPES)[number]
@@ -34,6 +34,11 @@ export interface InboundContentQuestionAnswer {
   answers: { id: string; value: string | string[] }[]
 }
 
+/** Content carried by an inbound frontend-independent system command. */
+export interface InboundContentSystemCommand {
+  command: string
+}
+
 /**
  * A validated inbound envelope (Flink → Harness).
  * `session_id` is `null` when the sender leaves session routing to the binding.
@@ -46,7 +51,7 @@ export interface InboundEnvelope {
   message_id: string
   correlation_id?: string | null
   type: InboundType
-  content: InboundContentMessage | InboundContentQuestionAnswer
+  content: InboundContentMessage | InboundContentQuestionAnswer | InboundContentSystemCommand
   metadata: Record<string, unknown>
 }
 
@@ -63,13 +68,16 @@ export type OutboundContent =
   | string
   | { text: string }
   | { questions: OutboundQuestion[] }
+  | { command: string; status: 'ok' | 'error'; message: string; session_id?: string }
 
 /** An outbound envelope (Harness → Flink). */
 export interface OutboundEnvelope {
   version: number
   conversation_id: string
   session_id: string | null
-  correlation_id: string | null
+  /** Echoed inbound id for deterministic system-command results. */
+  message_id?: string
+  correlation_id?: string | null
   type: OutboundType
   /** Optional media type promoted to wire field `content_type`. */
   contentType?: string

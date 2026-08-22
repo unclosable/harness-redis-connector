@@ -26,9 +26,12 @@ export interface AgentHandleLike {
   dispose(): Promise<void>
 }
 
-/** Create-options port; the resolver supplies only a session id. */
+/** Create-options port; the resolver supplies a session id and optional title. */
 export interface CreateAgentOptionsLike {
   readonly sessionId: string
+  readonly title?: string
+  /** Existing session whose runtime configuration a renewal should inherit. */
+  readonly sourceSessionId?: string
 }
 
 /** Resume-options port; the resolver supplies only the resumed session id. */
@@ -66,6 +69,18 @@ export interface ResolvedAgent {
 /** The resolve surface the inbound adapter consumes. */
 export interface SessionResolverLike {
   resolve(conversationId: string, requestedSessionId: string | null, fresh: boolean): Promise<ResolvedAgent>
+  renew(conversationId: string, title?: string): Promise<RenewedSession>
+}
+
+/** A freshly-created session returned by a system-command renewal. */
+export interface RenewedSession {
+  readonly sessionId: string
+  readonly handle: AgentHandleLike
+}
+
+interface CreatedOwnedSession extends ResolvedAgent {
+  readonly sessionId: string
+  readonly handle: AgentHandleLike
 }
 
 export interface SessionResolverOptions {
@@ -140,11 +155,22 @@ export class SessionResolver implements SessionResolverLike {
     return this.createOwned(conversationId)
   }
 
-  private async createOwned(conversationId: string): Promise<ResolvedAgent> {
+  /** Create and bind a fresh session without driving an agent turn. */
+  async renew(conversationId: string, title?: string): Promise<RenewedSession> {
+    const sourceSessionId = await this.bindings.sessionIdFor(conversationId)
+    const { sessionId, handle } = await this.createOwned(conversationId, title, sourceSessionId)
+    return { sessionId, handle }
+  }
+
+  private async createOwned(conversationId: string, title?: string, sourceSessionId?: string): Promise<CreatedOwnedSession> {
     const sessionId = this.freshSessionId()
-    const handle = await this.agents.create({ sessionId })
+    const handle = await this.agents.create({
+      sessionId,
+      ...(title !== undefined ? { title } : {}),
+      ...(sourceSessionId !== undefined ? { sourceSessionId } : {}),
+    })
     await this.bindings.bind(conversationId, sessionId)
-    return { agent: handle.agent, owned: true, handle }
+    return { agent: handle.agent, owned: true, sessionId, handle }
   }
 
   private async isPersisted(id: string): Promise<boolean> {

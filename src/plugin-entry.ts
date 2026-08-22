@@ -11,7 +11,7 @@
  */
 
 import type { Context } from '@deepseek-ai/cordis'
-import type { Agent } from '@deepseek-ai/dsh-agent'
+import { installModelSelection, type Agent, type ModelSelectionRef } from '@deepseek-ai/dsh-agent'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { randomUUID } from 'crypto'
 import { SessionId, type Session, type SessionEvent } from '@deepseek-ai/dsh-session'
@@ -25,6 +25,7 @@ import { RedisConversationBindingStore } from './binding-store/index.js'
 import { InboundAdapter, type ErrorEmitter } from './inbound-adapter/index.js'
 import { OutboundProjector, OutboundSender, buildErrorEnvelope } from './outbound-projector/index.js'
 import { RedisReceiptStore } from './receipt-store/index.js'
+import { RedisCommandResultStore } from './command-result-store/index.js'
 import { IoredisRedisTransport, createRedisClient } from './redis-transport/index.js'
 import { SessionResolver, type AgentHandleLike, type AgentRegistryLike } from './session-resolver/index.js'
 import { InMemoryConversationState } from './state/conversation-state.js'
@@ -46,6 +47,7 @@ const DEFAULT_BLOCK_MS = 5000
 const DEFAULT_RECEIPT_TTL_MS = 86_400_000
 const DEFAULT_BINDING_KEY_PREFIX = 'harness-redis-connector:binding'
 const DEFAULT_RECEIPT_KEY_PREFIX = 'harness-redis-connector:receipt'
+const DEFAULT_COMMAND_RESULT_KEY_PREFIX = 'harness-redis-connector:command-result'
 
 /** Plugin config: Redis connection, stream/consumer names, and per-agent options. */
 export interface Config {
@@ -69,6 +71,8 @@ export interface Config {
   bindingKeyPrefix?: string
   /** Redis key prefix for receipt keys. */
   receiptKeyPrefix?: string
+  /** Redis key prefix for durable system-command result records. */
+  commandResultKeyPrefix?: string
   /** Provider route for created/resumed agents. */
   provider?: string
   /** Model name for created/resumed agents. */
@@ -88,6 +92,7 @@ export const Config: Schema<Config> = Schema.object({
   receiptTtlMs: Schema.number().default(DEFAULT_RECEIPT_TTL_MS),
   bindingKeyPrefix: Schema.string().default(DEFAULT_BINDING_KEY_PREFIX),
   receiptKeyPrefix: Schema.string().default(DEFAULT_RECEIPT_KEY_PREFIX),
+  commandResultKeyPrefix: Schema.string().default(DEFAULT_COMMAND_RESULT_KEY_PREFIX),
   provider: Schema.string(),
   model: Schema.string(),
   cwd: Schema.string(),
@@ -99,6 +104,44 @@ function agentOptions(config: Config): { provider?: string; model?: string } {
     ...config.provider !== undefined ? { provider: config.provider } : {},
     ...config.model !== undefined ? { model: config.model } : {},
   }
+}
+
+/** Public structural view of the optional agent-preset service. */
+interface AgentPresetsLike {
+  resolve?(id?: string): Promise<{ id: string }>
+  mount(agentCtx: Context, id?: string): Promise<unknown>
+}
+
+/** Public structural view of the optional workspace registry service. */
+interface WorkspaceRegistryLike {
+  resolveByPath(path: string): Promise<{
+    attachSession(sessionId: SessionId): Promise<void>
+  } | undefined>
+}
+
+/** The latest durable preset selection wins over the creation header. */
+function selectedAgentPreset(session: Session): string | undefined {
+  for (let index = session.events.length - 1; index >= 0; index -= 1) {
+    const event = session.events[index] as { type?: string; data?: { agentPreset?: unknown } } | undefined
+    if (event?.type === 'agent-preset/selected' && typeof event.data?.agentPreset === 'string') {
+      return event.data.agentPreset
+    }
+  }
+  return session.header.agentPreset
+}
+
+/** The runtime settings needed to recreate or resume an existing session. */
+interface StoredSessionConfig {
+  provider?: string
+  model?: string
+  maxTokens?: number
+  cwd?: string
+  agentPreset?: string
+}
+
+/** Narrow unknown event payloads without depending on private session internals. */
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
 /**
@@ -119,13 +162,180 @@ export function apply(ctx: Context, config: Config): void {
     config.receiptKeyPrefix ?? DEFAULT_RECEIPT_KEY_PREFIX,
     Math.max(1, Math.floor((config.receiptTtlMs ?? DEFAULT_RECEIPT_TTL_MS) / 1000)),
   )
+  const commandResultTtlSeconds = Math.max(1, Math.floor((config.receiptTtlMs ?? DEFAULT_RECEIPT_TTL_MS) / 1000))
+  const resultStore = new RedisCommandResultStore(
+    client,
+    config.commandResultKeyPrefix ?? DEFAULT_COMMAND_RESULT_KEY_PREFIX,
+  )
   const state = new InMemoryConversationState()
   const ownedHandles = new Set<AgentHandleLike>()
+  const sessionTitleSvc = ctx.get('sessionTitle') as unknown as {
+    get(session: Session): { title?: string } | undefined
+    rename(session: Session, title: string): unknown
+  } | undefined
+
+  /**
+   * Read a session's recreation settings from the live registries when present,
+   * otherwise fold its durable snapshot. A persistence failure intentionally
+   * leaves callers with their ordinary connector-config fallback.
+   */
+  const readSessionConfig = async (sourceId: SessionId): Promise<StoredSessionConfig> => {
+    const sourceSession = ctx.agents.get(sourceId)?.session
+      ?? (ctx.get('sessions') as unknown as { get(id: SessionId): Session | undefined } | undefined)?.get(sourceId)
+    if (sourceSession !== undefined) {
+      const sourceConfig = sourceSession.requestHeader()?.config
+      const agentPreset = selectedAgentPreset(sourceSession)
+      return {
+        ...(sourceConfig?.provider !== undefined ? { provider: sourceConfig.provider } : {}),
+        ...(sourceConfig?.model !== undefined ? { model: sourceConfig.model } : {}),
+        ...(sourceConfig?.maxTokens !== undefined ? { maxTokens: sourceConfig.maxTokens } : {}),
+        ...(sourceSession.header.cwd !== undefined ? { cwd: sourceSession.header.cwd } : {}),
+        ...(agentPreset !== undefined ? { agentPreset } : {}),
+      }
+    }
+
+    try {
+      const persistence = ctx.get('sessionPersistence')
+      if (persistence === undefined) return {}
+      const { meta, events } = await persistence.load(sourceId)
+      let requestHeaderFound = false
+      let agentPresetFound = false
+      let provider: string | undefined
+      let model: string | undefined
+      let maxTokens: number | undefined
+      let agentPreset: string | undefined = meta.agentPreset
+
+      for (let index = events.length - 1; index >= 0; index -= 1) {
+        const event: SessionEvent = events[index]!
+        // The runtime can contain newer public event variants than this
+        // connector's compiled SessionEvent union, so inspect their payloads
+        // defensively without importing DSH's private event internals.
+        const persistedEvent = event as unknown as { type?: unknown; data?: unknown }
+        if (!requestHeaderFound && event.type === 'request/header') {
+          requestHeaderFound = true
+          const data = isRecord(persistedEvent.data) ? persistedEvent.data : undefined
+          const header = data !== undefined && isRecord(data['header']) ? data['header'] : undefined
+          const requestConfig = header !== undefined && isRecord(header['config']) ? header['config'] : undefined
+          provider = typeof requestConfig?.['provider'] === 'string' ? requestConfig['provider'] : undefined
+          model = typeof requestConfig?.['model'] === 'string' ? requestConfig['model'] : undefined
+          maxTokens = typeof requestConfig?.['maxTokens'] === 'number' ? requestConfig['maxTokens'] : undefined
+        }
+        if (!agentPresetFound && persistedEvent.type === 'agent-preset/selected') {
+          agentPresetFound = true
+          const data = isRecord(persistedEvent.data) ? persistedEvent.data : undefined
+          if (typeof data?.['agentPreset'] === 'string') agentPreset = data['agentPreset']
+        }
+        if (requestHeaderFound && agentPresetFound) break
+      }
+
+      return {
+        ...(provider !== undefined ? { provider } : {}),
+        ...(model !== undefined ? { model } : {}),
+        ...(maxTokens !== undefined ? { maxTokens } : {}),
+        ...(meta.cwd !== undefined ? { cwd: meta.cwd } : {}),
+        ...(agentPreset !== undefined ? { agentPreset } : {}),
+      }
+    } catch (error: unknown) {
+      logger.warn(`could not load persisted configuration for session ${sourceId}: ${describeError(error)}`)
+      return {}
+    }
+  }
+
+  /** Resolve and mount a persisted preset, preserving its selected model route. */
+  const presetSetup = async (
+    sourceId: SessionId,
+    agentPreset: string | undefined,
+    provider: string | undefined,
+    model: string | undefined,
+  ): Promise<{ resolvedPreset?: string; setup?: (agentCtx: Context) => Promise<void> }> => {
+    const presets = ctx.get('agentPresets') as unknown as AgentPresetsLike | undefined
+    if (agentPreset === undefined || presets === undefined) {
+      logger.warn(`session ${sourceId} cannot inherit its agent preset; continuing without preset composition`)
+      return {}
+    }
+    const resolvedPreset = presets.resolve === undefined ? agentPreset : (await presets.resolve(agentPreset)).id
+    const modelSelection: ModelSelectionRef | undefined = provider !== undefined && model !== undefined
+      ? { current: { provider, model }, assembled: undefined }
+      : undefined
+    return {
+      resolvedPreset,
+      setup: async (agentCtx: Context) => {
+        // ApiProxy's installSelection is private. This is its public equivalent.
+        if (modelSelection !== undefined) installModelSelection(agentCtx, modelSelection)
+        await presets.mount(agentCtx, resolvedPreset)
+      },
+    }
+  }
 
   const agentsPort: AgentRegistryLike = {
     get: id => ctx.agents.get(SessionId(id)),
-    create: options => ctx.agents.create({ sessionId: SessionId(options.sessionId), agentOptions: agentOptions(config), meta: { cwd } }),
-    resume: options => ctx.agents.resume({ resumeSessionId: SessionId(options.resumeSessionId), agentOptions: agentOptions(config) }),
+    create: async options => {
+      let handle: Awaited<ReturnType<typeof ctx.agents.create>>
+      if (options.sourceSessionId === undefined) {
+        handle = await ctx.agents.create({ sessionId: SessionId(options.sessionId), agentOptions: agentOptions(config), meta: { cwd } })
+      } else {
+        const sourceId = SessionId(options.sourceSessionId)
+        const sourceConfig = await readSessionConfig(sourceId)
+        const fallback = agentOptions(config)
+        const provider = sourceConfig?.provider ?? fallback.provider
+        const model = sourceConfig?.model ?? fallback.model
+        const maxTokens = sourceConfig?.maxTokens
+        const inheritedOptions = {
+          ...(provider !== undefined ? { provider } : {}),
+          ...(model !== undefined ? { model } : {}),
+          ...(maxTokens !== undefined ? { maxTokens } : {}),
+        }
+        const inheritedCwd = sourceConfig.cwd ?? cwd
+        const { resolvedPreset, setup } = await presetSetup(sourceId, sourceConfig.agentPreset, provider, model)
+
+        handle = await ctx.agents.create({
+          sessionId: SessionId(options.sessionId),
+          agentOptions: inheritedOptions,
+          meta: {
+            cwd: inheritedCwd,
+            ...(resolvedPreset !== undefined ? { agentPreset: resolvedPreset } : {}),
+          },
+          ...(setup !== undefined ? { setup } : {}),
+        })
+      }
+      const sessionCwd = handle.agent.session.header.cwd
+      const workspaceRegistry = ctx.get('workspaceRegistry') as unknown as WorkspaceRegistryLike | undefined
+      if (workspaceRegistry !== undefined && sessionCwd !== undefined) {
+        try {
+          const workspace = await workspaceRegistry.resolveByPath(sessionCwd)
+          if (workspace !== undefined) await workspace.attachSession(SessionId(options.sessionId))
+        } catch (error: unknown) {
+          logger.warn(`workspace session attachment failed: ${describeError(error)}`)
+        }
+      }
+      if (typeof options.title === 'string' && options.title.trim() !== '' && sessionTitleSvc !== undefined) {
+        try {
+          sessionTitleSvc.rename(handle.agent.session, options.title)
+        } catch (error: unknown) {
+          logger.warn(`session title rename failed: ${describeError(error)}`)
+        }
+      }
+      return handle
+    },
+    resume: async options => {
+      const resumeSessionId = SessionId(options.resumeSessionId)
+      const sourceConfig = await readSessionConfig(resumeSessionId)
+      const fallback = agentOptions(config)
+      const provider = sourceConfig.provider ?? fallback.provider
+      const model = sourceConfig.model ?? fallback.model
+      const maxTokens = sourceConfig.maxTokens
+      const restoredOptions = {
+        ...(provider !== undefined ? { provider } : {}),
+        ...(model !== undefined ? { model } : {}),
+        ...(maxTokens !== undefined ? { maxTokens } : {}),
+      }
+      const { setup } = await presetSetup(resumeSessionId, sourceConfig.agentPreset, provider, model)
+      return ctx.agents.resume({
+        resumeSessionId,
+        agentOptions: restoredOptions,
+        ...(setup !== undefined ? { setup } : {}),
+      })
+    },
   }
 
   const resolver = new SessionResolver({
@@ -164,6 +374,7 @@ export function apply(ctx: Context, config: Config): void {
     transport,
     resolver,
     receipts,
+    resultStore,
     bindings,
     state,
     ownedHandles,
@@ -175,6 +386,8 @@ export function apply(ctx: Context, config: Config): void {
     batchSize: config.batchSize ?? DEFAULT_BATCH_SIZE,
     blockMs: config.blockMs ?? DEFAULT_BLOCK_MS,
     onError: emitError,
+    emitOutbound: envelope => sender.send(envelope),
+    commandResultTtlSeconds,
     pendingQuestions,
   })
 
@@ -199,8 +412,6 @@ export function apply(ctx: Context, config: Config): void {
     // assert the returned service shapes against the canonical router/service
     // types imported for type safety.
     const userQuestions = ctx.get('userQuestions') as unknown as { registerRouter: (router: UserQuestionRouter) => () => void } | undefined
-    const sessionTitleSvc = ctx.get('sessionTitle') as unknown as { get(session: Session): { title?: string } | undefined } | undefined
-
     if (!userQuestions || !sessionTitleSvc) {
       logger.error('required services userQuestions or sessionTitle not available')
       throw new Error('missing required services')
@@ -307,8 +518,6 @@ export function apply(ctx: Context, config: Config): void {
 
   // Register an approval handler that wins the waterfall for bot-* sessions.
   try {
-    const sessionTitleSvc = ctx.get('sessionTitle') as unknown as { get(session: Session): { title?: string } | undefined } | undefined
-
     if (ctx.approval === undefined || !sessionTitleSvc) {
       logger.warn('approval service or sessionTitle not available; skipping approval routing')
     } else {

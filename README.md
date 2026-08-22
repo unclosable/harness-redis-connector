@@ -6,9 +6,11 @@ Agents/Sessions in both directions. It speaks the wire contract in
 Telegram integration).
 
 - **Inbound** (`harness:inbound`): consumes messages via a consumer group and
-  admits them to Harness as `agent.followup(...)` / `agent.steer(...)` /
-  `new_session` (fresh agent + rebind). ACKs after safe admission, not after the
-  agent finishes responding.
+  admits ordinary messages to Harness as `agent.followup(...)` / `agent.steer(...)` /
+  `new_session` (fresh agent + rebind). It also handles frontend-independent
+  `system_command` requests such as `renew_session` without starting an agent
+  turn, returning a durable, replayable `system_command_result`. ACKs after safe
+  admission/result emission, not after the agent finishes responding.
 - **Outbound** (`harness:outbound`): projects durable `session/event`
   `assistant/message` text into `assistant_message` envelopes, and `turn/end`
   error reasons + live `agent/error` into `error` envelopes.
@@ -33,10 +35,15 @@ Modules under `src/` are layered, one responsibility each:
   active session.
 - `receipt-store/` — `InboundReceiptStore` interface + in-memory and Redis
   implementations (idempotency on `message_id`, with TTL).
+- `command-result-store/` — durable serialized `system_command_result` records;
+  duplicate delivery re-emits the stored result without repeating a control
+  transition.
 - `session-resolver/` — `conversation_id → session_id → live/persisted/fresh`,
-  with binding-consistency enforcement and `new_session` rebinding. A persisted
-  session whose header lacks a `cwd` is never resumed: it is replaced by a fresh
-  session (with `meta.cwd`) on the next inbound message.
+  with binding-consistency enforcement, `new_session` rebinding, and `renew`
+  (fresh session + rebind, with no turn). `resume` restores persisted model and
+  preset configuration. A persisted session whose header lacks a `cwd` is never
+  resumed: it is replaced by a fresh session (with `meta.cwd`) on the next
+  inbound message.
 - `inbound-adapter/` — the consumer: parse → idempotency → resolve →
   followup/steer/new_session → XACK.
 - `outbound-projector/` — subscribes to the firehose, projects bound sessions.
@@ -98,15 +105,23 @@ plugin config). All keys are optional and have defaults:
 | `receiptTtlMs` | `86400000` | Idempotency receipt TTL |
 | `bindingKeyPrefix` | `harness-redis-connector:binding` | Key prefix for the binding hashes |
 | `receiptKeyPrefix` | `harness-redis-connector:receipt` | Key prefix for receipt keys |
-| `provider` / `model` | — | Per-agent options for created/resumed agents |
+| `commandResultKeyPrefix` | `harness-redis-connector:command-result` | Key prefix for durable system-command results |
+| `provider` / `model` | — | Fallback options for created/resumed agents when no persisted source configuration can be read |
 
 Environment variable supported as a convenience fallback: `REDIS_URL` (used only
 when `config.redisUrl` is absent).
 
 ## Wire conventions (summarized from PROTOCOL.md)
 
-- Inbound `type`: `message` | `new_session` | `steer`; outbound `type`:
-  `assistant_message` | `error`.
+- Inbound `type`: `message` | `new_session` | `steer` | `question_answer` |
+  `system_command`; outbound `type`: `assistant_message` | `error` |
+  `question_request` | `system_command_result`.
+- `system_command { command: "renew_session" }` creates and binds a fresh
+  initialized session without calling `followup`/`steer` or invoking an LLM. The
+  replacement inherits the source session's `provider`/`model`/`maxTokens`/`cwd`/
+  agent preset, is titled `bot-<botId>`, and is attached to the workspace
+  matching its `cwd`. Its stored result is replayed across duplicate delivery;
+  see `PROTOCOL.md` for the failure and redelivery contract.
 - Envelope fields are `snake_case`; `content` and `metadata` are objects.
 - `message_id` is the external idempotency key; `correlation_id` on outbound is
   the originating inbound `message_id`.

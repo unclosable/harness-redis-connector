@@ -129,6 +129,17 @@ describe('protocol validation', () => {
     }
   })
 
+  it('accepts a system_command without restricting its command name', () => {
+    const result = parseInboundEnvelope(inbound({ type: 'system_command', content: { command: 'renew_session' } }))
+    expect(result.kind).toBe('ok')
+    if (result.kind === 'ok') expect(result.envelope.content).toEqual({ command: 'renew_session' })
+  })
+
+  it('rejects malformed system_command content', () => {
+    expect(parseInboundEnvelope(inbound({ type: 'system_command', content: {} })).kind).toBe('error')
+    expect(parseInboundEnvelope(inbound({ type: 'system_command', content: { command: '' } })).kind).toBe('error')
+  })
+
   it('serializes a question_request outbound envelope', () => {
     const envelope: OutboundEnvelope = {
       version: 1,

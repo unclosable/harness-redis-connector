@@ -80,6 +80,16 @@ export function parseInboundEnvelope(raw: string): InboundParseResult {
         return { kind: 'error', reason: 'answer.value must be a string or array of strings' }
       }
     }
+  } else if (type === 'system_command') {
+    const command = typeof content === 'object' && content !== null && !Array.isArray(content)
+      ? (content as Record<string, unknown>)['command']
+      : undefined
+    if (
+      typeof command !== 'string'
+      || command.length === 0
+    ) {
+      return { kind: 'error', reason: 'content.command must be a non-empty string' }
+    }
   } else {
     if (
       typeof content !== 'object'
@@ -106,7 +116,9 @@ export function parseInboundEnvelope(raw: string): InboundParseResult {
       type: type as InboundType,
       content: type === 'question_answer'
         ? ({ answers: (content as Record<string, unknown>)['answers'] as { id: string; value: string | string[] }[] })
-        : ({ text: (content as Record<string, unknown>)['text'] as string }),
+        : type === 'system_command'
+          ? ({ command: (content as Record<string, unknown>)['command'] as string })
+          : ({ text: (content as Record<string, unknown>)['text'] as string }),
       metadata: (metadata ?? {}) as Record<string, unknown>,
     },
   }

@@ -42,12 +42,31 @@ below as an additive exception.
 }
 ```
 
-`type` ∈ `message` | `new_session` | `steer` | `question_answer`.
+`type` ∈ `message` | `new_session` | `steer` | `question_answer` | `system_command`.
 
 - `message`       → `agent.followup(...)`
 - `steer`         → `agent.steer(...)`
 - `new_session`   → create a fresh Harness Agent/Session and rebind the conversation to it (do NOT delete the prior session).
 - `question_answer` → a structured answer to a prior `question_request` (see Outbound). This is NOT a chat message: it resolves a pending `ask()` on the connector side and MUST never start a new turn (do not call `session.prompt`/`followup`/`steer`).
+- `system_command` → a frontend-independent control request. It never starts an agent turn and receives a deterministic `system_command_result` (see below).
+
+Example `system_command` (Flink → Harness):
+
+```json
+{
+  "version": 1,
+  "conversation_id": "telegram:<botId>:chat:<chatId>",
+  "session_id": null,
+  "message_id": "telegram-update-1001",
+  "type": "system_command",
+  "content": { "command": "renew_session" },
+  "metadata": { "chatId": "<chatId>", "botId": "<botId>" }
+}
+```
+
+`content.command` must be a non-empty string. Validation deliberately does not
+restrict its value: the connector handler decides whether a command is
+implemented, allowing future additive commands at version 1.
 
 Example `question_answer` (Flink → Harness):
 
@@ -80,11 +99,57 @@ Example `question_answer` (Flink → Harness):
 }
 ```
 
-`type` ∈ `assistant_message` | `error` | `question_request`.
+`type` ∈ `assistant_message` | `error` | `question_request` | `system_command_result`.
 
 - `assistant_message` → normal assistant output.
 - `error`             → error routing/processing info.
 - `question_request`  → request that the external side render a question to the user and return a `question_answer` (see Inbound).
+- `system_command_result` → deterministic, frontend-independent result of a
+  `system_command`; the external side renders `content.message` directly.
+
+### System control commands
+
+Version 1 currently supports only `renew_session`. It creates and initializes a
+fresh Harness session through the normal connector creation path, atomically
+rebinds the conversation to it, and does **not** call `followup`, `steer`, or
+otherwise invoke an LLM/agent turn. The prior session is not deleted.
+The fresh session inherits the source session's provider, model, cwd, and agent
+preset, and is titled `bot-<botId>`; these are connector-side execution details,
+not new wire fields.
+
+On success the connector emits:
+
+```json
+{
+  "version": 1,
+  "conversation_id": "telegram:<botId>:chat:<chatId>",
+  "session_id": "<new-session-id>",
+  "message_id": "<echoed message_id>",
+  "type": "system_command_result",
+  "content": { "command": "renew_session", "status": "ok", "session_id": "<new-session-id>", "message": "Session renewed." },
+  "metadata": { "chatId": "<chatId>", "botId": "<botId>" }
+}
+```
+
+On a create/bind failure it leaves the active binding unchanged and emits
+`status: "error"`, the active `session_id` (or `null`), and
+`content.message: "Session renewal failed."`. An unrecognized command emits
+an error result without creating or driving an agent. `content.status` is always
+`ok` or `error`.
+
+Command handling is at-least-once but transition-at-most-once per `message_id`:
+the connector first checks a Redis command-result record, re-emitting its stored
+serialized result on duplicate delivery. On the first delivery it claims the
+normal receipt, performs the command once, stores the serialized result with an
+expiry **before** XADD, then emits and ACKs. If XADD fails the entry remains
+pending and redelivery replays the stored result. If a prior attempt has a
+receipt but no result record (for example a crash in the small interval before
+storage), it emits `"Session renewal could not be confirmed."` and never repeats
+the transition. Future system commands use this same result-store/receipt model.
+
+`/renew` takes precedence over an interactive free-text reply: when it is sent in
+reply to a pending question, it is treated as a `system_command` and does not
+consume the pending free-text answer.
 
 `assistant_message` may add top-level `content_type: "text/markdown"` and use a
 plain string `content` (rather than `{ "text": "..." }`). This is additive at
@@ -140,9 +205,13 @@ parsing the `telegram:chat:` prefix of `conversation_id`).
 ## Delivery semantics
 
 - At-least-once. The external `message_id` is the application-level idempotency key.
+  Its `telegram-update-<updateId>` form is not bot-scoped, a known pre-existing
+  limitation shared with normal message deduplication.
 - The Harness connector XACKs after the message is safely admitted to Harness
   (i.e. after idempotency check + session resolution + `followup`/`steer`/rebind),
   NOT after the agent finishes producing a response.
+- For `system_command`, the command result is durably stored before outbound
+  emission; the entry is ACKed only after result emission succeeds.
 - Pending-entry recovery (`XPENDING` / `XAUTOCLAIM`) is used for consumer restart.
 - Poison messages (malformed, permanently invalid) are logged and eventually
   acknowledged or parked; a dedicated DLQ is deferred for MVP.

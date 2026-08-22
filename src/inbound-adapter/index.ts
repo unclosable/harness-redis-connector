@@ -1,6 +1,8 @@
-import { parseInboundEnvelope, type InboundEnvelope } from '../protocol/index.js'
+import { parseInboundEnvelope, serializeOutboundEnvelope, type InboundEnvelope, type OutboundEnvelope } from '../protocol/index.js'
 import type { ConversationBindingStore } from '../binding-store/types.js'
 import type { InboundReceiptStore } from '../receipt-store/types.js'
+import type { CommandResultStore } from '../command-result-store/types.js'
+import { buildSystemCommandResultEnvelope } from '../outbound-projector/envelopes.js'
 import type { RedisTransport, StreamEntry } from '../redis-transport/types.js'
 import { BindingConflictError, type AgentHandleLike, type SessionResolverLike } from '../session-resolver/index.js'
 import type { ConversationState } from '../state/conversation-state.js'
@@ -40,6 +42,11 @@ export interface ErrorEmitter {
   (details: { conversationId?: string; messageId?: string; text: string }): void | Promise<void>
 }
 
+/** Sends a fully-formed outbound envelope through the configured stream sender. */
+export interface OutboundEmitter {
+  (envelope: OutboundEnvelope): Promise<void>
+}
+
 export type PendingEntry = {
   conversationId: string
   sessionId?: string | null
@@ -52,6 +59,7 @@ export interface InboundAdapterOptions {
   readonly transport: RedisTransport
   readonly resolver: SessionResolverLike
   readonly receipts: InboundReceiptStore
+  readonly resultStore: CommandResultStore
   readonly bindings: ConversationBindingStore
   readonly state: ConversationState
   readonly ownedHandles: Set<AgentHandleLike>
@@ -64,6 +72,10 @@ export interface InboundAdapterOptions {
   readonly blockMs?: number
   /** Optional outbound error projection for malformed/conflicting messages. */
   readonly onError?: ErrorEmitter
+  /** Required sender for deterministic system-command result envelopes. */
+  readonly emitOutbound: OutboundEmitter
+  /** Result/receipt TTL window in seconds. */
+  readonly commandResultTtlSeconds: number
   /** Optional pending question map managed by the plugin to resolve ask() calls. */
   readonly pendingQuestions?: Map<string, PendingEntry>
 }
@@ -78,6 +90,8 @@ export class InboundAdapter {
   private readonly transport: RedisTransport
   private readonly resolver: SessionResolverLike
   private readonly receipts: InboundReceiptStore
+  private readonly resultStore: CommandResultStore
+  private readonly bindings: ConversationBindingStore
   private readonly state: ConversationState
   private readonly ownedHandles: Set<AgentHandleLike>
   private readonly createUserMessage: (text: string) => UserMessageLike
@@ -88,12 +102,16 @@ export class InboundAdapter {
   private readonly batchSize: number
   private readonly blockMs: number
   private readonly onError: ErrorEmitter | undefined
+  private readonly emitOutbound: OutboundEmitter
+  private readonly commandResultTtlSeconds: number
   private readonly pendingQuestions: Map<string, PendingEntry>
 
   constructor(options: InboundAdapterOptions) {
     this.transport = options.transport
     this.resolver = options.resolver
     this.receipts = options.receipts
+    this.resultStore = options.resultStore
+    this.bindings = options.bindings
     this.state = options.state
     this.ownedHandles = options.ownedHandles
     this.createUserMessage = options.createUserMessage
@@ -104,6 +122,8 @@ export class InboundAdapter {
     this.batchSize = options.batchSize ?? 10
     this.blockMs = options.blockMs ?? 5000
     this.onError = options.onError
+    this.emitOutbound = options.emitOutbound
+    this.commandResultTtlSeconds = options.commandResultTtlSeconds
     this.pendingQuestions = options.pendingQuestions ?? new Map()
   }
 
@@ -173,7 +193,85 @@ export class InboundAdapter {
       await this.safeAck(entry.id)
       return { acked: true, admitted: false, duplicate: false, reason: 'unknown type' }
     }
+    // System commands replay their stored result for duplicates, rather than
+    // being silently dropped by the generic receipt dedupe path.
+    if (parsed.envelope.type === 'system_command') return this.handleSystemCommand(entry, parsed.envelope)
     return this.admit(entry, parsed.envelope)
+  }
+
+  private async handleSystemCommand(entry: StreamEntry, envelope: InboundEnvelope): Promise<ProcessOutcome> {
+    await this.state.recordInbound(envelope.conversation_id, envelope.message_id, envelope.metadata)
+    const existing = await this.resultStore.get(envelope.message_id)
+    if (existing !== undefined) {
+      await this.emitSerializedCommandResult(existing)
+      await this.safeAck(entry.id)
+      return { acked: true, admitted: true, duplicate: true }
+    }
+
+    const claimed = await this.receipts.claim(envelope.message_id)
+    if (!claimed) {
+      const result = this.buildCommandResult(envelope, 'error', 'Session renewal could not be confirmed.', await this.activeSessionId(envelope.conversation_id))
+      await this.emitSerializedCommandResult(serializeOutboundEnvelope(result))
+      await this.safeAck(entry.id)
+      return { acked: true, admitted: false, duplicate: true, reason: 'missing stored command result' }
+    }
+
+    const command = (envelope.content as { command: string }).command
+    let result: OutboundEnvelope
+    if (command !== 'renew_session') {
+      result = this.buildCommandResult(envelope, 'error', 'Unsupported system command.', await this.activeSessionId(envelope.conversation_id))
+    } else {
+      try {
+        const renewed = await this.resolver.renew(envelope.conversation_id, this.botSessionTitle(envelope))
+        this.ownedHandles.add(renewed.handle)
+        result = this.buildCommandResult(envelope, 'ok', 'Session renewed.', renewed.sessionId)
+      } catch (error: unknown) {
+        this.logger.error(`inbound ${entry.id}: session renewal failed — ${describeError(error)}`)
+        result = this.buildCommandResult(envelope, 'error', 'Session renewal failed.', await this.activeSessionId(envelope.conversation_id))
+      }
+    }
+
+    const serialized = serializeOutboundEnvelope(result)
+    await this.resultStore.set(envelope.message_id, serialized, this.commandResultTtlSeconds)
+    await this.emitSerializedCommandResult(serialized)
+    await this.safeAck(entry.id)
+    return { acked: true, admitted: true, duplicate: false }
+  }
+
+  private botSessionTitle(envelope: InboundEnvelope): string {
+    const metadataBotId = envelope.metadata.botId
+    if (typeof metadataBotId === 'string' && metadataBotId.trim() !== '') return `bot-${metadataBotId.trim()}`
+
+    const parts = envelope.conversation_id.split(':')
+    const conversationBotId = parts.length === 4 && parts[0] === 'telegram' && parts[2] === 'chat' && parts[3]?.trim() !== ''
+      ? parts[1]?.trim()
+      : undefined
+    return `bot-${conversationBotId || 'session'}`
+  }
+
+  private buildCommandResult(
+    envelope: InboundEnvelope,
+    status: 'ok' | 'error',
+    message: string,
+    sessionId: string | undefined,
+  ): OutboundEnvelope {
+    return buildSystemCommandResultEnvelope({
+      conversationId: envelope.conversation_id,
+      sessionId,
+      messageId: envelope.message_id,
+      command: (envelope.content as { command: string }).command,
+      status,
+      message,
+      metadata: envelope.metadata,
+    })
+  }
+
+  private async activeSessionId(conversationId: string): Promise<string | undefined> {
+    return this.bindings.sessionIdFor(conversationId)
+  }
+
+  private async emitSerializedCommandResult(serialized: string): Promise<void> {
+    await this.emitOutbound(JSON.parse(serialized) as OutboundEnvelope)
   }
 
   private async admit(entry: StreamEntry, envelope: InboundEnvelope): Promise<ProcessOutcome> {
