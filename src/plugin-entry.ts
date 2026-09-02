@@ -15,7 +15,7 @@ import { installModelSelection, type Agent, type ModelSelectionRef } from '@deep
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { randomUUID } from 'crypto'
 import { SessionId, type Session, type SessionEvent } from '@deepseek-ai/dsh-session'
-import type { UserQuestionRouter, AskUserQuestionRequest, AskUserQuestionAnswer } from '@deepseek-ai/dsh-user-questions'
+import type { AskUserQuestionRequest, AskUserQuestionAnswer } from '@deepseek-ai/dsh-user-questions'
 
 import type { ApprovalRequest, ApprovalOutcome } from '@deepseek-ai/dsh-user-approval'
 import type {} from '@deepseek-ai/dsh-user-approval'   // Context augmentation: ctx.approval + 'approval/request' event
@@ -121,8 +121,9 @@ interface WorkspaceRegistryLike {
 
 /** The latest durable preset selection wins over the creation header. */
 function selectedAgentPreset(session: Session): string | undefined {
-  for (let index = session.events.length - 1; index >= 0; index -= 1) {
-    const event = session.events[index] as { type?: string; data?: { agentPreset?: unknown } } | undefined
+  const events = session.snapshotEvents()
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index] as { type?: string; data?: { agentPreset?: unknown } } | undefined
     if (event?.type === 'agent-preset/selected' && typeof event.data?.agentPreset === 'string') {
       return event.data.agentPreset
     }
@@ -405,28 +406,28 @@ export function apply(ctx: Context, config: Config): void {
     })
   })
 
-  // Register a UserQuestion router that routes asks for sessions whose
-  // sessionTitle starts with "bot-" to Redis via the outbound stream.
+  // Route interactive questions for sessions whose sessionTitle starts with
+  // "bot-" to Redis via the outbound stream. The native agent-scoped
+  // 'user-questions/request' waterfall (dsh ≥ 0.1.2) replaced the old
+  // single-provider registerRouter seam: an untagged listener is admitted for
+  // every agent, and next() (which takes no argument) delegates to the Web
+  // answerer.
   try {
-    // Obtain typed Cordis services without using `any` casts. Prefer ctx.get but
-    // assert the returned service shapes against the canonical router/service
-    // types imported for type safety.
-    const userQuestions = ctx.get('userQuestions') as unknown as { registerRouter: (router: UserQuestionRouter) => () => void } | undefined
-    if (!userQuestions || !sessionTitleSvc) {
-      logger.error('required services userQuestions or sessionTitle not available')
+    if (!sessionTitleSvc) {
+      logger.error('required service sessionTitle not available')
       throw new Error('missing required services')
     }
 
-    const disposer = userQuestions.registerRouter({
-      ask: async (request: AskUserQuestionRequest, next: (req: AskUserQuestionRequest) => Promise<AskUserQuestionAnswer>) => {
+    const disposer = ctx.on(
+      'user-questions/request',
+      async (request: AskUserQuestionRequest, next: () => Promise<AskUserQuestionAnswer>) => {
         // If no agent provided, or no session on the agent, fall through.
         const agent = request.agent as unknown as Agent | undefined
-        if (agent == null) return next(request)
+        if (agent == null) return next()
         const session = agent.session
 
-        const titleSnapshot = sessionTitleSvc.get(session)
-        const title = titleSnapshot?.title
-        if (!shouldRouteToRedis(title)) return next(request)
+        const title = sessionTitleSvc.get(session)?.title
+        if (!shouldRouteToRedis(title)) return next()
 
         // Route to Redis: require a conversation binding for this session.
         const sessionId = String(session.id)
@@ -501,17 +502,14 @@ export function apply(ctx: Context, config: Config): void {
           pendingQuestions.delete(correlationId)
         }
       },
-    })
+    )
 
-    // Ensure router is disposed on plugin shutdown and that pending asks are rejected.
-    ctx.effect(() => async () => {
-      disposer()
-      // Reject and remove all pending questions on shutdown.
-      for (const [corr, p] of pendingQuestions.entries()) {
-        try { p.reject(new Error('connector shutting down')) } catch {}
-        pendingQuestions.delete(corr)
-      }
-    }, 'harness-redis-connector.user-questions-dispose')
+    // Dispose the listener on plugin shutdown. This cordis fork has no public
+    // 'dispose' event (its Events interface declares only internal/* and dsh
+    // augmentations) — cleanup is effect-based on the owning fiber, so use
+    // ctx.effect (the same idiom as the old disposer wiring and the main
+    // dispose effect below).
+    ctx.effect(() => disposer, 'harness-redis-connector.user-questions-dispose')
   } catch (err) {
     logger.warn(`user-questions integration not registered: ${String(err)}`)
   }

@@ -1,41 +1,63 @@
-# DSH Core Integration — registerRouter seam
+# DSH Core Integration — agent-scoped user-questions waterfall
 
 Summary
 
-This connector depends on a small, local, additive seam applied to the DeepSeek
-Harness (uncommitted patch in the local harness checkout). The seam exposes a
-router registration API for the UserQuestionService so the connector can route
-interactive questions for `bot-*` sessions to Redis while leaving the Web
-provider as the default for non-bot sessions.
+This connector consumes the native, agent-scoped `user-questions/request`
+Cordis waterfall shipped by `@deepseek-ai/dsh-user-questions` (dsh ≥ 0.1.2).
+There is no local harness patch and no `registerRouter` seam anymore: upstream
+removed the single-provider UserQuestion model and replaced it with a scoped
+answerer waterfall. The connector registers one untagged listener that routes
+interactive questions for `bot-*` sessions to Redis while `next()` leaves the
+Web answerer as the default for everything else.
 
-1) What the seam is — exact API
+1) The contract — exact API
 
-The local patch adds the following (type-only) API to:
-packages/interaction/user-questions/src/index.ts
+The upstream service asks through a scoped Cordis waterfall
+(`packages/interaction/user-questions/src/index.ts`):
 
 ```ts
-// packages/interaction/user-questions/src/index.ts (local patch)
-interface UserQuestionRouter {
-  ask(request: AskUserQuestionRequest, next: (req: AskUserQuestionRequest) => Promise<AskUserQuestionAnswer>): Promise<AskUserQuestionAnswer>
-}
-registerRouter(router: UserQuestionRouter): () => void
+this.ctx.waterfall(
+  scopeTarget(agent, agent),
+  'user-questions/request',
+  { ...request, agent },
+  noAnswerer,
+)
 ```
 
-Behavioral note: next() forwards the request to the next router and ultimately
-forwards to the single Web provider. The seam is additive: it does not replace
-or remove the existing single-provider model, it merely allows registering a
-router chain before the Web provider.
+The event is declared on the Cordis `Events` interface (same package, `types.ts`):
 
-2) Why it exists
+```ts
+'user-questions/request'(
+  this: Scoped<Agent>,
+  request: AskUserQuestionRequestEvent,
+  next: () => Promise<AskUserQuestionAnswer>,
+): Promise<AskUserQuestionAnswer>
+```
 
-Upstream UserQuestionService supports exactly one global provider with no
-routing seam. A second provider registration is rejected (`DUPLICATE_PROVIDER`)
-and there is no getter to inspect or delegate to the Web provider. The connector
-needs to route only a subset of sessions (those whose session title starts with
-`bot-`) to Redis/Telegram while leaving all other interactive questions to the
-existing Web provider. The registerRouter seam is the minimal additive fix that
-lets the connector decide per-interaction whether to handle the question or
-call next() and let Web handle it.
+- The waterfall is agent-scoped via `scopeTarget(agent, agent)` from
+  `@deepseek-ai/dsh-scope`. Admission rule: **an untagged listener — one
+  registered with plain `ctx.on('user-questions/request', ...)` on an
+  unscoped context — is admitted for every agent** (the scope filter returns
+  `true` when the listener's context carries no scope tag). Tagged listeners
+  receive only events dispatched to their scope key or one of its ancestors.
+- `next` takes **no argument**: `next: () => Promise<AskUserQuestionAnswer>`.
+  A listener that wants to fall through calls `next()`; the value returned is
+  the next listener's answer, or the built-in `noAnswerer` rejection
+  (`UserQuestionError`, code `NO_PROVIDER`) when no listener claims the
+  request.
+- Returning an answer from a listener claims the request and vetoes the rest
+  of the chain (Cordis waterfall semantics: not calling `next()` stops it).
+
+2) Why it changed
+
+Upstream 0.1.1 supported exactly one global UserQuestion provider with no
+routing seam (a second registration was rejected with `DUPLICATE_PROVIDER`),
+so the connector previously relied on a small, local, additive
+`registerRouter` patch on `UserQuestionService`. That seam is gone: since
+0.1.2 the ask path is the agent-scoped waterfall above, which natively
+supports multiple listeners. The connector therefore needs no harness patch —
+an untagged listener is admitted for every agent and decides per interaction
+whether to answer via Redis or delegate with `next()`.
 
 3) How the connector consumes it
 
@@ -43,34 +65,43 @@ call next() and let Web handle it.
 
   ['agents', 'userQuestions', 'sessionTitle', 'approval']
 
-- During initialization the connector registers one router:
+  (`userQuestions` remains a real service and is kept for dependency wiring;
+  the listener itself is a plain event registration and needs no service
+  handle).
+
+- During initialization the connector registers one untagged listener:
 
 ```ts
-ctx.userQuestions.registerRouter({
-  async ask(request, next) {
-    const title = await ctx.sessionTitle.get(request.agent.session)?.title
-    if (title?.startsWith('bot-')) {
-      // route to Redis (emit question_request), await inbound question_answer
-      // resolve and return AskUserQuestionAnswer
-    }
-    return next(request)
-  }
-})
+const disposer = ctx.on(
+  'user-questions/request',
+  async (request: AskUserQuestionRequest, next: () => Promise<AskUserQuestionAnswer>) => {
+    const agent = request.agent as unknown as Agent | undefined
+    if (agent == null) return next()
+    const session = agent.session
+    const title = sessionTitleSvc.get(session)?.title
+    if (!shouldRouteToRedis(title)) return next()
+    const sessionId = String(session.id)
+    if (request.signal?.aborted) throw new Error('ask aborted')
+    // route to Redis: conversationId lookup, outbound question_request
+    // envelope, pending entry, sender.send, await the inbound answer
+    // and return the AskUserQuestionAnswer
+  },
+)
+ctx.effect(() => disposer, 'harness-redis-connector.user-questions-dispose')
 ```
 
-- Routing rule: if session title starts with `bot-` (exact prefix match) route
-  to Redis; otherwise call next(request) exactly once so the Web provider runs.
-
-- The connector also registers approval routing using the same seam (approvals
-  are implemented as a special question id `approval` — see PROTOCOL.md).
+- Routing rule: if the session title starts with `bot-` (exact prefix match)
+  route to Redis; otherwise call `next()` exactly once so the Web answerer
+  runs.
+- The listener is untagged, so it is admitted for every agent (see §1).
+- The connector also registers approval routing on the `approval/request`
+  waterfall (approvals are implemented as a special question id `approval` —
+  see PROTOCOL.md).
 
 4) Breaking-change detection (what to grep for after a DSH upgrade)
 
-If a future Harness upgrade removes or renames the seam, these are the exact
-failure signatures to look for:
-
-- Build-time TypeScript error
-  - "Property 'registerRouter' does not exist on type 'UserQuestionService'"
+The integration is now native — there is no compile-time seam to re-apply. The
+only failure signatures are runtime logs:
 
 - Runtime (silent/missed registration)
   - The connector's startup try/catch logs: "user-questions integration not registered"
@@ -78,25 +109,30 @@ failure signatures to look for:
 - Runtime (approvals routing)
   - The connector logs: "approval routing not registered" or "skipping approval routing"
 
-Re-apply note: re-add the seam to the Harness checkout, then rebuild the
-Harness's host library with:
+- If the upstream event signature changes (for example `next` gains an
+  argument again, the event name moves, or the request type changes), the
+  listener body will no longer typecheck — that is the compile-time signal.
 
-  pnpm run build:lib:host  # runs tsdown; necessary to refresh lib/index.js
+Re-apply note: nothing to re-apply in the Harness checkout for this
+integration. After a Harness upgrade rebuild the host library with:
+
+  pnpm run build:lib   # runs tsdown; refreshes lib/index.js for the host packages
 
 DO NOT rely on `tsc -b` alone — that refreshes only `lib/types/` and leaves
-`lib/index.js` stale. After re-apply + build restart `dsh web`.
+`lib/index.js` stale. After the rebuild restart `dsh web`.
 
 
 # Operational checklist (quick)
 
 - If connector interactive questions stop reaching Telegram but Web still
-  receives in-browser prompts: check that the seam is present and that the
-  connector's router registered successfully (see logs above).
+  receives in-browser prompts: check that the connector's listener registered
+  successfully (see logs above) and that the session title still starts with
+  `bot-`.
 
-- If the build fails with the TS Property error: reapply the local patch to the
-  Harness `packages/interaction/user-questions` and run `pnpm run build:lib:host`.
+- If the listener fails to register, the startup try/catch logs
+  "user-questions integration not registered" and questions fall back to Web.
 
-- If approvals fail to escalate to Telegram: check for the "approval routing not registered" log and follow the same re-apply + tsdown rebuild steps.
+- If approvals fail to escalate to Telegram: check for the "approval routing not registered" log.
 
 
 (End of DSH integration notes)

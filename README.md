@@ -161,13 +161,19 @@ diagnostic commands, and recovery procedures), see
   outbound `error`) rather than silently rebinding; a `new_session` always
   rebinds.
 
-## DSH-core dependency
+## DSH integration (user-questions waterfall)
 
-This connector requires a small, local, additive patch to the DeepSeek Harness
-that exposes a `registerRouter` seam on the UserQuestionService. See
-`docs/dsh-integration.md` for the exact API, why it's needed, how the connector
-uses it, and how to detect and recover from breaking changes after a DSH
-upgrade.
+Interactive questions and approvals for `bot-*` sessions route to Redis through
+the native agent-scoped Cordis waterfall events shipped by dsh ≥ 0.1.2
+(`user-questions/request`, plus `approval/request` for approvals) — there is no
+local DSH-core patch and no `registerRouter` seam anymore, and nothing in the
+Harness checkout needs re-applying after an upgrade. The connector registers one
+untagged `ctx.on('user-questions/request', (request, next) => …)` listener
+(admitted for every agent) that answers via Redis when the session title starts
+with `bot-` and otherwise calls `next()` — which takes no argument — so the Web
+answerer runs. See `docs/dsh-integration.md` for the exact API and the failure
+signatures: the only runtime signal is the silent startup log
+`user-questions integration not registered`; there is no compile-time seam.
 
 ## License
 

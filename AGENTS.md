@@ -87,12 +87,18 @@ exactly.
 
 ## Interactive questions
 
-The connector registers a user-question router via the DSH `userQuestions` seam:
-`ctx.userQuestions.registerRouter({ ask(request, next) })`.
+The connector registers one untagged listener on the native agent-scoped
+`user-questions/request` Cordis waterfall (dsh ≥ 0.1.2), inside the startup
+try/catch:
 
-Routing rule: for each interaction the router reads the originating session's
-title and routes to Redis only if `title.startsWith('bot-')` (exact match on
-prefix). Otherwise the router calls `next(request)` once (Web behavior unchanged).
+  ctx.on('user-questions/request', async (request, next) => { … })
+
+An untagged listener is admitted for every agent; `next` takes no argument.
+
+Routing rule: for each request the listener reads the originating session's
+title and answers via Redis only if `title.startsWith('bot-')` (exact match on
+prefix). Otherwise it calls `next()` once so the Web answerer runs (Web behavior
+unchanged).
 
 Redis path and mapping:
 - `conversation_id` is taken from the existing `ConversationBindingStore`.
@@ -106,9 +112,12 @@ Behavioral notes:
 - `question_answer` is dispatched before session resolution and NEVER calls
   `session.prompt`/`followup`/`steer` — it resolves the pending `ask()` only.
 
-Dependency: this requires the DSH-core `registerRouter` seam in
-`packages/interaction/user-questions` (local harness patch). Connector `inject`
-must include `['agents','userQuestions','sessionTitle']`.
+Dependency: none on DSH-core — the integration depends only on the native
+`user-questions/request` waterfall shipped by `@deepseek-ai/dsh-user-questions`
+(dsh ≥ 0.1.2). Connector `inject` is
+`['agents','userQuestions','sessionTitle','approval']` (`userQuestions` remains a
+real service and is kept for dependency wiring; the listener itself is a plain
+event registration).
 
 ## Commands
 
@@ -124,6 +133,8 @@ The same `test`/`typecheck` scripts also run from this directory.
 
 ## DSH-core dependency
 
-The connector relies on the local DSH patch that exposes
-`ctx.userQuestions.registerRouter(...)`. See `docs/dsh-integration.md` for the
-exact API and operational notes.
+The connector depends on native dsh features only — the `user-questions/request`
+and `approval/request` waterfalls and `ctx.agents.create` — all of which still
+exist upstream (dsh ≥ 0.1.2). There is no local DSH-core patch and nothing to
+re-apply after an upgrade. See `docs/dsh-integration.md` for the exact API and
+the runtime failure signatures.
