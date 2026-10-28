@@ -33,11 +33,16 @@ below as an additive exception.
 ```json
 {
   "version": 1,
-  "conversation_id": "telegram:chat:12345",
+  "conversation_id": "telegram:operator:chat:12345",
   "session_id": null,
   "message_id": "telegram-update-1001",
   "type": "message",
-  "content": { "text": "帮我检查一下这个项目" },
+  "content": {
+    "text": "caption or empty string",
+    "images": [
+      { "media_type": "image/jpeg", "name": "photo-1001.jpg", "width": 1280, "height": 960, "data": "<canonical base64>" }
+    ]
+  },
   "metadata": {}
 }
 ```
@@ -49,6 +54,7 @@ below as an additive exception.
 - `new_session`   → create a fresh Harness Agent/Session and rebind the conversation to it (do NOT delete the prior session).
 - `question_answer` → a structured answer to a prior `question_request` (see Outbound). This is NOT a chat message: it resolves a pending `ask()` on the connector side and MUST never start a new turn (do not call `session.prompt`/`followup`/`steer`).
 - `system_command` → a frontend-independent control request. It never starts an agent turn and receives a deterministic `system_command_result` (see below).
+- For `message`/`steer`, `content.text` is always a string and may be empty only when `content.images` is present and non-empty. `content.images` is ordered and optional; each image requires `media_type` (`image/png` | `image/jpeg` | `image/webp` | `image/gif`) and canonical base64 `data`. Optional `name`, `width`, and `height` are advisory metadata.
 
 Example `system_command` (Flink → Harness):
 
@@ -90,18 +96,30 @@ Example `question_answer` (Flink → Harness):
 ```json
 {
   "version": 1,
-  "conversation_id": "telegram:chat:12345",
+  "conversation_id": "telegram:operator:chat:12345",
   "session_id": "harness-session-id",
   "correlation_id": "telegram-update-1001",
   "type": "assistant_message",
-  "content": { "text": "..." },
+  "content_type": "text/markdown",
+  "content": {
+    "text": "here is the chart",
+    "images": [
+      { "media_type": "image/png", "name": "chart.png", "data": "<canonical base64>" }
+    ]
+  },
   "metadata": { "chatId": "12345" }
 }
 ```
 
 `type` ∈ `assistant_message` | `error` | `question_request` | `system_command_result`.
 
-- `assistant_message` → normal assistant output.
+For `telegram:<botId>:chat:<chatId>` conversations, outbound `metadata` carries
+both `{ "chatId": "<chatId>", "botId": "<botId>" }`. The connector derives
+these values from the conversation id when process-local inbound state is empty
+after a restart. Legacy `telegram:chat:<chatId>` conversations carry `chatId`
+only; they never imply a default `botId`.
+
+- `assistant_message` → normal assistant output. `images` is optional/additive; `text` + `content_type` keep the existing text/markdown behavior. The connector may produce images from local image references shown in assistant markdown and from `deliverables/presented`; a markdown reference is removed from `content.text` only after its local image was forwarded successfully. `http`, `https`, `data`, and `dsh-app` references and references in inline/fenced code are untouched. Each image is capped at 10,485,760 bytes and admitted by PNG/JPEG/WebP/GIF magic bytes, not its extension. Dedupe is by canonical path per session/turn, cleared at turn end and capped at two unfinished turns per session. By default canonical paths must be inside the canonical session cwd or OS temporary directory, so symlinks cannot escape; `outboundImagesOutsideCwd: true` permits any readable image.
 - `error`             → error routing/processing info.
 - `question_request`  → request that the external side render a question to the user and return a `question_answer` (see Inbound).
 - `system_command_result` → deterministic, frontend-independent result of a
@@ -151,9 +169,10 @@ the transition. Future system commands use this same result-store/receipt model.
 reply to a pending question, it is treated as a `system_command` and does not
 consume the pending free-text answer.
 
-`assistant_message` may add top-level `content_type: "text/markdown"` and use a
-plain string `content` (rather than `{ "text": "..." }`). This is additive at
-version 1: legacy object-shaped content remains accepted. The Flink bridge
+`assistant_message` keeps `content_type: "text/markdown"` for text. Text-only
+payloads may continue to use plain-string `content` for backward compatibility.
+When assistant images are present, `content` is object-shaped with `text` plus
+optional ordered `images`. This is additive at version 1. The Flink bridge
 converts its supported CommonMark subset to Telegram MarkdownV2.
 
 Example `question_request` (Harness → Flink):

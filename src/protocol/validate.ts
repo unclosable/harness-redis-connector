@@ -1,4 +1,15 @@
-import { INBOUND_TYPES, PROTOCOL_VERSION, type InboundEnvelope, type InboundType } from './types.js'
+import { Buffer } from 'node:buffer'
+import {
+  INBOUND_TYPES,
+  PROTOCOL_VERSION,
+  type InboundContentImage,
+  type InboundEnvelope,
+  type InboundType,
+  type ProtocolImageMediaType,
+} from './types.js'
+
+const IMAGE_MEDIA_TYPES: readonly ProtocolImageMediaType[] = ['image/png', 'image/jpeg', 'image/webp', 'image/gif']
+const MAX_IMAGE_DECODED_BYTES = 20 * 1024 * 1024
 
 /**
  * Result of parsing one inbound JSON payload. The three variants map to the
@@ -48,6 +59,7 @@ export function parseInboundEnvelope(raw: string): InboundParseResult {
   const correlation_id = record['correlation_id']
   const content = record['content']
   const metadata = record['metadata']
+  let messageImages: InboundContentImage[] = []
 
   if (typeof conversation_id !== 'string' || conversation_id.length === 0) {
     return { kind: 'error', reason: 'conversation_id must be a non-empty string' }
@@ -91,13 +103,15 @@ export function parseInboundEnvelope(raw: string): InboundParseResult {
       return { kind: 'error', reason: 'content.command must be a non-empty string' }
     }
   } else {
-    if (
-      typeof content !== 'object'
-      || content === null
-      || Array.isArray(content)
-      || typeof (content as Record<string, unknown>)['text'] !== 'string'
-    ) {
+    if (typeof content !== 'object' || content === null || Array.isArray(content) || typeof (content as Record<string, unknown>)['text'] !== 'string') {
       return { kind: 'error', reason: 'content.text must be a string' }
+    }
+    const parsedImages = validateInboundImages(content as Record<string, unknown>)
+    if (parsedImages.kind === 'error') return parsedImages
+    messageImages = parsedImages.images
+    const text = (content as Record<string, unknown>)['text'] as string
+    if (text.length === 0 && messageImages.length === 0) {
+      return { kind: 'error', reason: 'content.text must be non-empty when content.images is absent' }
     }
   }
 
@@ -118,8 +132,73 @@ export function parseInboundEnvelope(raw: string): InboundParseResult {
         ? ({ answers: (content as Record<string, unknown>)['answers'] as { id: string; value: string | string[] }[] })
         : type === 'system_command'
           ? ({ command: (content as Record<string, unknown>)['command'] as string })
-          : ({ text: (content as Record<string, unknown>)['text'] as string }),
+          : ({
+            text: (content as Record<string, unknown>)['text'] as string,
+            ...messageImages.length > 0 ? { images: messageImages } : {},
+          }),
       metadata: (metadata ?? {}) as Record<string, unknown>,
     },
   }
+}
+
+function validateInboundImages(content: Record<string, unknown>):
+  | { kind: 'ok'; images: InboundContentImage[] }
+  | { kind: 'error'; reason: string } {
+  const rawImages = content['images']
+  if (rawImages === undefined) return { kind: 'ok', images: [] }
+  if (!Array.isArray(rawImages)) return { kind: 'error', reason: 'content.images must be an array when present' }
+
+  const images: InboundContentImage[] = []
+  for (let index = 0; index < rawImages.length; index += 1) {
+    const value = rawImages[index]
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+      return { kind: 'error', reason: `content.images[${index}] must be an object` }
+    }
+    const image = value as Record<string, unknown>
+    const mediaType = image['media_type']
+    if (typeof mediaType !== 'string' || !IMAGE_MEDIA_TYPES.includes(mediaType as ProtocolImageMediaType)) {
+      return { kind: 'error', reason: `content.images[${index}].media_type must be one of ${IMAGE_MEDIA_TYPES.join(', ')}` }
+    }
+    const data = image['data']
+    if (typeof data !== 'string' || data.length === 0) {
+      return { kind: 'error', reason: `content.images[${index}].data must be a canonical base64 string` }
+    }
+    let decoded: Buffer
+    try {
+      decoded = Buffer.from(data, 'base64')
+    } catch {
+      return { kind: 'error', reason: `content.images[${index}].data must be canonical base64` }
+    }
+    if (decoded.length === 0 || decoded.toString('base64') !== data) {
+      return { kind: 'error', reason: `content.images[${index}].data must be canonical base64` }
+    }
+    if (decoded.length > MAX_IMAGE_DECODED_BYTES) {
+      return { kind: 'error', reason: `content.images[${index}] exceeds the 20 MiB decoded image limit` }
+    }
+
+    const name = image['name']
+    if (name !== undefined && typeof name !== 'string') {
+      return { kind: 'error', reason: `content.images[${index}].name must be a string when present` }
+    }
+
+    const width = image['width']
+    if (width !== undefined && (typeof width !== 'number' || !Number.isInteger(width) || width <= 0)) {
+      return { kind: 'error', reason: `content.images[${index}].width must be a positive integer when present` }
+    }
+
+    const height = image['height']
+    if (height !== undefined && (typeof height !== 'number' || !Number.isInteger(height) || height <= 0)) {
+      return { kind: 'error', reason: `content.images[${index}].height must be a positive integer when present` }
+    }
+
+    images.push({
+      media_type: mediaType as ProtocolImageMediaType,
+      data,
+      ...name !== undefined ? { name } : {},
+      ...width !== undefined ? { width: width as number } : {},
+      ...height !== undefined ? { height: height as number } : {},
+    })
+  }
+
+  return { kind: 'ok', images }
 }

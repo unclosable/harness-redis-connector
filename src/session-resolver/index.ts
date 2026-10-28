@@ -48,13 +48,13 @@ export interface AgentRegistryLike {
 
 /**
  * Persistence-existence check port (backed by `sessionPersistence.list`).
- * The real harness `list()` returns full `SessionHeader`s; only `id` and
- * `cwd` are used here. A header whose `cwd` is undefined is treated as NOT
- * persisted, so the session is re-created fresh (with `meta.cwd`) instead of
+ * The real harness `list()` returns snapshots containing `header`; only its
+ * `id` and `cwd` are used here. A header whose `cwd` is undefined is treated as NOT
+ * persisted, so the session is re-created fresh (with `header.cwd`) instead of
  * resumed.
  */
 export interface SessionPersistenceLike {
-  list(): Promise<Array<{ id: string; cwd?: string }>>
+  list(options?: unknown): Promise<readonly { readonly header: { readonly id: string; readonly cwd?: string } }[]>
 }
 
 /** A resolution result: the live agent plus ownership of its handle. */
@@ -175,7 +175,7 @@ export class SessionResolver implements SessionResolverLike {
 
   private async isPersisted(id: string): Promise<boolean> {
     if (this.persistence === undefined) return false
-    const headers = await this.persistence.list()
-    return headers.some(header => header.id === id && header.cwd !== undefined)
+    const snapshots = await this.persistence.list()
+    return snapshots.some(snapshot => snapshot.header.id === id && snapshot.header.cwd !== undefined)
   }
 }

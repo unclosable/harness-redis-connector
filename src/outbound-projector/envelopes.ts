@@ -1,4 +1,4 @@
-import { PROTOCOL_VERSION, type OutboundEnvelope } from '../protocol/index.js'
+import { PROTOCOL_VERSION, type OutboundContentImage, type OutboundEnvelope } from '../protocol/index.js'
 
 /** Inputs for building an `assistant_message` envelope. */
 export interface AssistantEnvelopeArgs {
@@ -6,6 +6,7 @@ export interface AssistantEnvelopeArgs {
   sessionId: string
   correlationId: string | undefined
   text: string
+  images?: OutboundContentImage[]
   metadata: Record<string, unknown>
 }
 
@@ -31,6 +32,7 @@ export interface SystemCommandResultEnvelopeArgs {
 
 /** Build an outbound `assistant_message` envelope. */
 export function buildAssistantEnvelope(args: AssistantEnvelopeArgs): OutboundEnvelope {
+  const images = args.images ?? []
   return {
     version: PROTOCOL_VERSION,
     conversation_id: args.conversationId,
@@ -38,7 +40,7 @@ export function buildAssistantEnvelope(args: AssistantEnvelopeArgs): OutboundEnv
     correlation_id: args.correlationId ?? null,
     type: 'assistant_message',
     contentType: 'text/markdown',
-    content: args.text,
+    content: images.length === 0 ? args.text : { text: args.text, images },
     metadata: args.metadata,
   }
 }

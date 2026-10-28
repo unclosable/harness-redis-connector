@@ -11,9 +11,17 @@
  */
 
 import type { Context } from '@deepseek-ai/cordis'
-import { installModelSelection, type Agent, type ModelSelectionRef } from '@deepseek-ai/dsh-agent'
+import { installModelSelection, type Agent, type AgentOptions } from '@deepseek-ai/dsh-agent'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
+import {
+  AttachmentError,
+  type AdmittedPromptContentPart,
+  type AttachmentAdmissionPart,
+  type ImageAttachmentRef,
+} from '@deepseek-ai/dsh-attachment'
 import { randomUUID } from 'crypto'
+import { realpath } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import { SessionId, type Session, type SessionEvent } from '@deepseek-ai/dsh-session'
 import type { AskUserQuestionRequest, AskUserQuestionAnswer } from '@deepseek-ai/dsh-user-questions'
 
@@ -22,7 +30,7 @@ import type {} from '@deepseek-ai/dsh-user-approval'   // Context augmentation: 
 import Schema from '@deepseek-ai/schemastery'
 import type {} from '@deepseek-ai/dsh-session-persistence'
 import { RedisConversationBindingStore } from './binding-store/index.js'
-import { InboundAdapter, type ErrorEmitter } from './inbound-adapter/index.js'
+import { InboundAdapter, type DriveAgentLike, type ErrorEmitter } from './inbound-adapter/index.js'
 import { OutboundProjector, OutboundSender, buildErrorEnvelope } from './outbound-projector/index.js'
 import { RedisReceiptStore } from './receipt-store/index.js'
 import { RedisCommandResultStore } from './command-result-store/index.js'
@@ -30,7 +38,7 @@ import { IoredisRedisTransport, createRedisClient } from './redis-transport/inde
 import { SessionResolver, type AgentHandleLike, type AgentRegistryLike } from './session-resolver/index.js'
 import { InMemoryConversationState } from './state/conversation-state.js'
 import { describeError } from './util.js'
-import type { OutboundEnvelope } from './protocol/types.js'
+import type { InboundContentMessage, OutboundEnvelope } from './protocol/types.js'
 import { shouldRouteToRedis, mapQuestionsToOutbound, mapFlinkAnswersToAskAnswer } from './user-questions.js'
 
 export const name = 'harness-redis-connector'
@@ -79,6 +87,8 @@ export interface Config {
   model?: string
   /** Working directory for newly created agents; defaults to `process.cwd()`. */
   cwd?: string
+  /** Allow outbound local images outside the session cwd and OS temp directory. */
+  outboundImagesOutsideCwd?: boolean
 }
 
 export const Config: Schema<Config> = Schema.object({
@@ -96,13 +106,77 @@ export const Config: Schema<Config> = Schema.object({
   provider: Schema.string(),
   model: Schema.string(),
   cwd: Schema.string(),
+  outboundImagesOutsideCwd: Schema.boolean().default(false),
 })
 
-/** Per-agent options from plugin config, without assigning absent optional fields. */
-function agentOptions(config: Config): { provider?: string; model?: string } {
+/** Structural view of the optional service added in DSH 0.2.1. */
+interface AgentDefaultModelLike {
+  currentSelection(): {
+    provider: string
+    model: string
+    reasoningEffort?: AgentOptions['reasoningEffort']
+  }
+}
+
+interface LlmLike {
+  resolveModelInfo(provider: string, model: string): Promise<{
+    inputModalities?: readonly string[]
+  }>
+}
+
+interface AttachmentStoreLike {
+  admitPromptContent(content: readonly AttachmentAdmissionPart[]): Promise<readonly AdmittedPromptContentPart[]>
+}
+
+interface OutboundAttachmentReaderLike {
+  readImage(ref: ImageAttachmentRef): Promise<{ data: Uint8Array }>
+}
+
+interface OutboundFileSystemLike {
+  resolve(path: string, options?: { cwd?: string }): Promise<unknown>
+  processPath(target: unknown): string
+  stat(target: unknown): Promise<{ type: string; size?: number } | undefined>
+  readBytes(target: unknown, signal: AbortSignal | undefined, maxBytes: number): Promise<Uint8Array>
+}
+
+interface WorkingDirectoryLike {
+  ensure(agent: Agent, signal?: AbortSignal): Promise<string>
+}
+
+interface ModelSelectionLike {
+  provider: string
+  model: string
+}
+
+interface BuildInboundUserMessageDeps {
+  ctx: Context
+  config: Config
+  sender: OutboundSender
+}
+
+/**
+ * Per-agent options from plugin config, falling back to the live deployment
+ * default. Getters deliberately defer the default lookup until each step.
+ */
+export function agentOptions(config: Config, ctx: Context): AgentOptions {
+  const defaults = (): AgentDefaultModelLike | undefined => (
+    ctx.get('agentDefaultModel') as unknown as AgentDefaultModelLike | undefined
+  )
+
   return {
-    ...config.provider !== undefined ? { provider: config.provider } : {},
-    ...config.model !== undefined ? { model: config.model } : {},
+    get provider() { return config.provider ?? defaults()?.currentSelection().provider },
+    get model() { return config.model ?? defaults()?.currentSelection().model },
+    get reasoningEffort() { return defaults()?.currentSelection().reasoningEffort },
+  }
+}
+
+/** Preserve an explicit source route, while leaving missing fields live. */
+function inheritedAgentOptions(source: StoredSessionConfig, fallback: AgentOptions): AgentOptions {
+  return {
+    get provider() { return source.provider ?? fallback.provider },
+    get model() { return source.model ?? fallback.model },
+    get reasoningEffort() { return fallback.reasoningEffort },
+    ...(source.maxTokens !== undefined ? { maxTokens: source.maxTokens } : {}),
   }
 }
 
@@ -143,6 +217,104 @@ interface StoredSessionConfig {
 /** Narrow unknown event payloads without depending on private session internals. */
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function resolveModelSelection(agent: DriveAgentLike, config: Config, ctx: Context): ModelSelectionLike | undefined {
+  const current = agent.model?.current()
+  if (current?.provider !== undefined && current.model !== undefined) {
+    return { provider: current.provider, model: current.model }
+  }
+
+  const defaults = ctx.get('agentDefaultModel') as unknown as AgentDefaultModelLike | undefined
+  const fallback = defaults?.currentSelection()
+  const provider = config.provider ?? fallback?.provider
+  const model = config.model ?? fallback?.model
+  if (provider === undefined || model === undefined) return undefined
+  return { provider, model }
+}
+
+async function modelSupportsImageInput(
+  llm: LlmLike | undefined,
+  selection: ModelSelectionLike | undefined,
+  logger: ReturnType<Context['logger']>,
+): Promise<boolean> {
+  if (llm === undefined || selection === undefined) return true
+  try {
+    const info = await llm.resolveModelInfo(selection.provider, selection.model)
+    if (info.inputModalities === undefined) return true
+    return info.inputModalities.includes('image')
+  } catch (error: unknown) {
+    logger.warn(`llm model capability lookup failed: ${describeError(error)}`)
+    return true
+  }
+}
+
+function toAttachmentParts(content: InboundContentMessage): AttachmentAdmissionPart[] {
+  const parts: AttachmentAdmissionPart[] = [{ type: 'text', text: content.text }]
+  for (const image of content.images ?? []) {
+    parts.push({
+      type: 'image',
+      mediaType: image.media_type,
+      data: image.data,
+      ...image.name !== undefined ? { name: image.name } : {},
+    })
+  }
+  return parts
+}
+
+export function createInboundUserMessageBuilder(deps: BuildInboundUserMessageDeps) {
+  const logger = deps.ctx.logger('harness-redis-connector')
+  const llm = deps.ctx.get('llm') as unknown as LlmLike | undefined
+
+  return async (
+    agent: DriveAgentLike,
+    content: InboundContentMessage,
+    context: { conversationId: string; messageId: string; metadata: Record<string, unknown> },
+  ) => {
+    if ((content.images?.length ?? 0) === 0) {
+      return createUserMessage({ content: [{ type: 'text', text: content.text }], source: { kind: 'user' } })
+    }
+
+    const modelSelection = resolveModelSelection(agent, deps.config, deps.ctx)
+    const supportsImages = await modelSupportsImageInput(llm, modelSelection, logger)
+    if (!supportsImages) {
+      await deps.sender.send(buildErrorEnvelope({
+        conversationId: context.conversationId,
+        correlationId: context.messageId,
+        text: 'The current model does not accept image input. Switch to an image-capable model and try again.',
+        metadata: context.metadata,
+      }))
+      return undefined
+    }
+
+    const attachments = deps.ctx.get('attachments') as unknown as AttachmentStoreLike | undefined
+    if (attachments === undefined) {
+      await deps.sender.send(buildErrorEnvelope({
+        conversationId: context.conversationId,
+        correlationId: context.messageId,
+        text: 'Image input is not available in this session because attachment storage is not configured.',
+        metadata: context.metadata,
+      }))
+      return undefined
+    }
+
+    try {
+      const admittedContent = await attachments.admitPromptContent(toAttachmentParts(content))
+      return createUserMessage({ content: admittedContent, source: { kind: 'user' } })
+    } catch (error: unknown) {
+      if (error instanceof AttachmentError) {
+        const code = error.code ?? 'ATTACHMENT_ERROR'
+        await deps.sender.send(buildErrorEnvelope({
+          conversationId: context.conversationId,
+          correlationId: context.messageId,
+          text: `Image admission failed (${code}): ${error.message}`,
+          metadata: context.metadata,
+        }))
+        return undefined
+      }
+      throw error
+    }
+  }
 }
 
 /**
@@ -198,13 +370,28 @@ export function apply(ctx: Context, config: Config): void {
     try {
       const persistence = ctx.get('sessionPersistence')
       if (persistence === undefined) return {}
-      const { meta, events } = await persistence.load(sourceId)
+      // Mirror DSH's cold-read path: a read handle owns the persisted header
+      // and must always be closed after its event slice is observed.
+      const handle = await persistence.open(sourceId, 'read')
+      let events: readonly SessionEvent[]
+      try {
+        ({ events } = await handle.read(0))
+      } catch (error: unknown) {
+        try {
+          await handle.close()
+        } catch {
+          // Preserve the read failure, matching DSH's cold-reader semantics.
+        }
+        throw error
+      }
+      await handle.close()
+      const { header } = handle
       let requestHeaderFound = false
       let agentPresetFound = false
       let provider: string | undefined
       let model: string | undefined
       let maxTokens: number | undefined
-      let agentPreset: string | undefined = meta.agentPreset
+      let agentPreset: string | undefined = header.agentPreset
 
       for (let index = events.length - 1; index >= 0; index -= 1) {
         const event: SessionEvent = events[index]!
@@ -233,7 +420,7 @@ export function apply(ctx: Context, config: Config): void {
         ...(provider !== undefined ? { provider } : {}),
         ...(model !== undefined ? { model } : {}),
         ...(maxTokens !== undefined ? { maxTokens } : {}),
-        ...(meta.cwd !== undefined ? { cwd: meta.cwd } : {}),
+        ...(header.cwd !== undefined ? { cwd: header.cwd } : {}),
         ...(agentPreset !== undefined ? { agentPreset } : {}),
       }
     } catch (error: unknown) {
@@ -246,8 +433,6 @@ export function apply(ctx: Context, config: Config): void {
   const presetSetup = async (
     sourceId: SessionId,
     agentPreset: string | undefined,
-    provider: string | undefined,
-    model: string | undefined,
   ): Promise<{ resolvedPreset?: string; setup?: (agentCtx: Context) => Promise<void> }> => {
     const presets = ctx.get('agentPresets') as unknown as AgentPresetsLike | undefined
     if (agentPreset === undefined || presets === undefined) {
@@ -255,14 +440,10 @@ export function apply(ctx: Context, config: Config): void {
       return {}
     }
     const resolvedPreset = presets.resolve === undefined ? agentPreset : (await presets.resolve(agentPreset)).id
-    const modelSelection: ModelSelectionRef | undefined = provider !== undefined && model !== undefined
-      ? { current: { provider, model }, assembled: undefined }
-      : undefined
     return {
       resolvedPreset,
       setup: async (agentCtx: Context) => {
-        // ApiProxy's installSelection is private. This is its public equivalent.
-        if (modelSelection !== undefined) installModelSelection(agentCtx, modelSelection)
+        installModelSelection(agentCtx)
         await presets.mount(agentCtx, resolvedPreset)
       },
     }
@@ -273,21 +454,13 @@ export function apply(ctx: Context, config: Config): void {
     create: async options => {
       let handle: Awaited<ReturnType<typeof ctx.agents.create>>
       if (options.sourceSessionId === undefined) {
-        handle = await ctx.agents.create({ sessionId: SessionId(options.sessionId), agentOptions: agentOptions(config), meta: { cwd } })
+        handle = await ctx.agents.create({ sessionId: SessionId(options.sessionId), agentOptions: agentOptions(config, ctx), meta: { cwd } })
       } else {
         const sourceId = SessionId(options.sourceSessionId)
         const sourceConfig = await readSessionConfig(sourceId)
-        const fallback = agentOptions(config)
-        const provider = sourceConfig?.provider ?? fallback.provider
-        const model = sourceConfig?.model ?? fallback.model
-        const maxTokens = sourceConfig?.maxTokens
-        const inheritedOptions = {
-          ...(provider !== undefined ? { provider } : {}),
-          ...(model !== undefined ? { model } : {}),
-          ...(maxTokens !== undefined ? { maxTokens } : {}),
-        }
+        const inheritedOptions = inheritedAgentOptions(sourceConfig, agentOptions(config, ctx))
         const inheritedCwd = sourceConfig.cwd ?? cwd
-        const { resolvedPreset, setup } = await presetSetup(sourceId, sourceConfig.agentPreset, provider, model)
+        const { resolvedPreset, setup } = await presetSetup(sourceId, sourceConfig.agentPreset)
 
         handle = await ctx.agents.create({
           sessionId: SessionId(options.sessionId),
@@ -321,16 +494,8 @@ export function apply(ctx: Context, config: Config): void {
     resume: async options => {
       const resumeSessionId = SessionId(options.resumeSessionId)
       const sourceConfig = await readSessionConfig(resumeSessionId)
-      const fallback = agentOptions(config)
-      const provider = sourceConfig.provider ?? fallback.provider
-      const model = sourceConfig.model ?? fallback.model
-      const maxTokens = sourceConfig.maxTokens
-      const restoredOptions = {
-        ...(provider !== undefined ? { provider } : {}),
-        ...(model !== undefined ? { model } : {}),
-        ...(maxTokens !== undefined ? { maxTokens } : {}),
-      }
-      const { setup } = await presetSetup(resumeSessionId, sourceConfig.agentPreset, provider, model)
+      const restoredOptions = inheritedAgentOptions(sourceConfig, agentOptions(config, ctx))
+      const { setup } = await presetSetup(resumeSessionId, sourceConfig.agentPreset)
       return ctx.agents.resume({
         resumeSessionId,
         agentOptions: restoredOptions,
@@ -347,7 +512,41 @@ export function apply(ctx: Context, config: Config): void {
 
   const outboundStream = config.outboundStream ?? DEFAULT_OUTBOUND_STREAM
   const sender = new OutboundSender(transport, outboundStream)
-  const projector = new OutboundProjector({ bindings, state, sender, logger })
+  const projector = new OutboundProjector({
+    bindings,
+    state,
+    sender,
+    logger,
+    outboundImagesOutsideCwd: config.outboundImagesOutsideCwd ?? false,
+    // Root-plane plugins are not injected on these optional services. Resolve
+    // them through the owning agent per projection: its scoped context carries
+    // the fs and attachment services after preset composition completes.
+    attachments: {
+      available: sessionId => ctx.agents.get(SessionId(sessionId))?.ctx.get('attachments') !== undefined,
+      readImage: (sessionId, ref) => (ctx.agents.get(SessionId(sessionId))?.ctx.get('attachments') as unknown as OutboundAttachmentReaderLike | undefined)?.readImage(ref)
+        ?? Promise.reject(new Error('attachments service is unavailable')),
+    },
+    localFiles: {
+      available: sessionId => ctx.agents.get(SessionId(sessionId))?.ctx.get('fs') !== undefined,
+      agentForSession: sessionId => ctx.agents.get(SessionId(sessionId)),
+      ensureWorkingDirectory: async agent => (agent as Agent).ctx.get('workingDirectory')?.ensure(agent as Agent),
+      resolve: (sessionId, path, options) => (ctx.agents.get(SessionId(sessionId))?.ctx.get('fs') as unknown as OutboundFileSystemLike | undefined)?.resolve(path, options)
+        ?? Promise.reject(new Error('fs service is unavailable')),
+      processPath: (sessionId, target) => {
+        const fs = ctx.agents.get(SessionId(sessionId))?.ctx.get('fs') as unknown as OutboundFileSystemLike | undefined
+        if (fs === undefined) throw new Error('fs service is unavailable')
+        return fs.processPath(target)
+      },
+      stat: (sessionId, target) => (ctx.agents.get(SessionId(sessionId))?.ctx.get('fs') as unknown as OutboundFileSystemLike | undefined)?.stat(target)
+        ?? Promise.reject(new Error('fs service is unavailable')),
+      readBytes: (sessionId, target, maxBytes) => (ctx.agents.get(SessionId(sessionId))?.ctx.get('fs') as unknown as OutboundFileSystemLike | undefined)?.readBytes(target, undefined, maxBytes)
+        ?? Promise.reject(new Error('fs service is unavailable')),
+      realpath,
+      temporaryDirectory: tmpdir,
+    },
+  })
+
+  const buildUserMessage = createInboundUserMessageBuilder({ ctx, config, sender })
 
   const emitError: ErrorEmitter = details => {
     if (details.conversationId === undefined) return
@@ -379,7 +578,7 @@ export function apply(ctx: Context, config: Config): void {
     bindings,
     state,
     ownedHandles,
-    createUserMessage: text => createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'user' } }),
+    buildUserMessage,
     logger,
     inboundStream: config.inboundStream ?? DEFAULT_INBOUND_STREAM,
     consumerGroup: config.consumerGroup ?? DEFAULT_CONSUMER_GROUP,

@@ -23,10 +23,24 @@ export const OUTBOUND_TYPES = ['assistant_message', 'error', 'question_request',
 /** Outbound `type` value. */
 export type OutboundType = (typeof OUTBOUND_TYPES)[number]
 
-/** Text content carried by an inbound message envelope. */
+/** Supported inline image media types for inbound/outbound envelope content. */
+export type ProtocolImageMediaType = 'image/png' | 'image/jpeg' | 'image/webp' | 'image/gif'
+
+/** One inbound inline image payload member. */
+export interface InboundContentImage {
+  media_type: ProtocolImageMediaType
+  data: string
+  name?: string
+  width?: number
+  height?: number
+}
+
+/** Text/image content carried by an inbound message envelope. */
 export interface InboundContentMessage {
   /** The message text (the Telegram instruction). */
   text: string
+  /** Optional ordered inline images. */
+  images?: InboundContentImage[]
 }
 
 /** Content carried by an inbound question_answer envelope. */
@@ -63,10 +77,24 @@ export interface OutboundQuestion {
   multi_select?: boolean
 }
 
+/** One outbound assistant image payload member. */
+export interface OutboundContentImage {
+  media_type: ProtocolImageMediaType
+  data: string
+  name?: string
+}
+
+/** Outbound assistant message content with optional inline images. */
+export interface OutboundAssistantContent {
+  text: string
+  images?: OutboundContentImage[]
+}
+
 /** Content for outbound assistant/error messages or a question_request. */
 export type OutboundContent =
   | string
   | { text: string }
+  | OutboundAssistantContent
   | { questions: OutboundQuestion[] }
   | { command: string; status: 'ok' | 'error'; message: string; session_id?: string }
 

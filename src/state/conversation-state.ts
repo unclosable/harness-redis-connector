@@ -35,13 +35,26 @@ export class InMemoryConversationState implements ConversationState {
   metadataFor(conversationId: string): Record<string, unknown> {
     const stored = this.metadata.get(conversationId)
     if (stored !== undefined) return stored
-    const chatId = deriveChatId(conversationId)
-    return chatId !== undefined ? { chatId } : {}
+    const routing = deriveTelegramRoutingMetadata(conversationId)
+    return routing ?? {}
   }
 }
 
-/** Recover the chat id from a `telegram:chat:<chatId>` conversation id. */
+/** Recover the chat id from a legacy or multi-bot Telegram conversation id. */
 export function deriveChatId(conversationId: string): string | undefined {
-  const match = /^telegram:chat:(.+)$/.exec(conversationId)
-  return match?.[1]
+  return deriveTelegramRoutingMetadata(conversationId)?.chatId
+}
+
+/**
+ * Recover routing metadata when process-local inbound state is empty after a
+ * restart, so a multi-bot conversation's first reply keeps its original bot.
+ */
+function deriveTelegramRoutingMetadata(conversationId: string): { chatId: string; botId?: string } | undefined {
+  const multiBotMatch = /^telegram:([^:]+):chat:(.+)$/.exec(conversationId)
+  if (multiBotMatch !== null) {
+    return { chatId: multiBotMatch[2]!, botId: multiBotMatch[1]! }
+  }
+
+  const legacyMatch = /^telegram:chat:(.+)$/.exec(conversationId)
+  return legacyMatch !== null ? { chatId: legacyMatch[1]! } : undefined
 }

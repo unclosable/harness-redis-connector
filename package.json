@@ -27,6 +27,7 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "@deepseek-ai/dsh-attachment": "workspace:^",
     "@deepseek-ai/dsh-llm": "workspace:^",
     "@deepseek-ai/dsh-session": "workspace:^",
     "@deepseek-ai/schemastery": "workspace:^",

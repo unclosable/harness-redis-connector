@@ -1,4 +1,4 @@
-import { parseInboundEnvelope, serializeOutboundEnvelope, type InboundEnvelope, type OutboundEnvelope } from '../protocol/index.js'
+import { parseInboundEnvelope, serializeOutboundEnvelope, type InboundContentMessage, type InboundEnvelope, type OutboundEnvelope } from '../protocol/index.js'
 import type { ConversationBindingStore } from '../binding-store/types.js'
 import type { InboundReceiptStore } from '../receipt-store/types.js'
 import type { CommandResultStore } from '../command-result-store/types.js'
@@ -18,6 +18,9 @@ export interface DriveAgentLike {
   readonly id: string
   followup(message: UserMessageLike): void
   steer(message: UserMessageLike): void
+  readonly model?: {
+    current(): { provider?: string; model?: string } | undefined
+  }
 }
 
 /** A user message the adapter builds (via an injected factory) and delivers. */
@@ -63,7 +66,11 @@ export interface InboundAdapterOptions {
   readonly bindings: ConversationBindingStore
   readonly state: ConversationState
   readonly ownedHandles: Set<AgentHandleLike>
-  readonly createUserMessage: (text: string) => UserMessageLike
+  readonly buildUserMessage: (
+    agent: DriveAgentLike,
+    content: InboundContentMessage,
+    context: { conversationId: string; messageId: string; metadata: Record<string, unknown> },
+  ) => Promise<UserMessageLike | undefined>
   readonly logger: LoggerLike
   readonly inboundStream: string
   readonly consumerGroup: string
@@ -94,7 +101,7 @@ export class InboundAdapter {
   private readonly bindings: ConversationBindingStore
   private readonly state: ConversationState
   private readonly ownedHandles: Set<AgentHandleLike>
-  private readonly createUserMessage: (text: string) => UserMessageLike
+  private readonly buildUserMessage: InboundAdapterOptions['buildUserMessage']
   private readonly logger: LoggerLike
   private readonly inboundStream: string
   private readonly consumerGroup: string
@@ -114,7 +121,7 @@ export class InboundAdapter {
     this.bindings = options.bindings
     this.state = options.state
     this.ownedHandles = options.ownedHandles
-    this.createUserMessage = options.createUserMessage
+    this.buildUserMessage = options.buildUserMessage
     this.logger = options.logger
     this.inboundStream = options.inboundStream
     this.consumerGroup = options.consumerGroup
@@ -332,8 +339,16 @@ export class InboundAdapter {
       const resolved = await this.resolver.resolve(envelope.conversation_id, envelope.session_id, fresh)
       const agent = resolved.agent as DriveAgentLike
       if (resolved.owned && resolved.handle !== undefined) this.ownedHandles.add(resolved.handle)
-      const contentMessage = envelope.content as { text: string }
-      const message = this.createUserMessage(contentMessage.text)
+      const contentMessage = envelope.content as InboundContentMessage
+      const message = await this.buildUserMessage(agent, contentMessage, {
+        conversationId: envelope.conversation_id,
+        messageId: envelope.message_id,
+        metadata: envelope.metadata,
+      })
+      if (message === undefined) {
+        await this.safeAck(entry.id)
+        return { acked: true, admitted: false, duplicate: false, reason: 'inbound message rejected' }
+      }
       if (envelope.type === 'steer') agent.steer(message)
       else agent.followup(message)
       this.state.recordInbound(envelope.conversation_id, envelope.message_id, envelope.metadata)

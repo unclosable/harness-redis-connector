@@ -77,8 +77,8 @@ exactly.
 - **System control commands.** `renew_session` uses `resolver.renew()` (the
   same fresh create + bind path as `new_session`) without `followup`/`steer` or
   any LLM turn. It inherits the replaced session's provider, model, maxTokens,
-  cwd, and agent preset from the live registry, else folds
-  `sessionPersistence.load(...)`; titles the replacement `bot-<botId>`; and
+  cwd, and agent preset from the live registry, else reads them through a
+  `sessionPersistence.open(..., 'read')` handle; titles the replacement `bot-<botId>`; and
   attaches it to the workspace resolved from its cwd. `resume` likewise restores
   persisted model/preset configuration so
   GUI-created sessions survive a web restart. The result-store record is the

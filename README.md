@@ -9,11 +9,25 @@ Telegram integration).
   admits ordinary messages to Harness as `agent.followup(...)` / `agent.steer(...)` /
   `new_session` (fresh agent + rebind). It also handles frontend-independent
   `system_command` requests such as `renew_session` without starting an agent
-  turn, returning a durable, replayable `system_command_result`. ACKs after safe
-  admission/result emission, not after the agent finishes responding.
+  turn, returning a durable, replayable `system_command_result`. Inbound
+  `message`/`steer` content supports optional ordered `images` (canonical
+  base64) plus text captions, admitted through `ctx.attachments` before turn
+  dispatch. ACKs after safe admission/result emission, not after the agent
+  finishes responding.
 - **Outbound** (`harness:outbound`): projects durable `session/event`
-  `assistant/message` text into `assistant_message` envelopes, and `turn/end`
-  error reasons + live `agent/error` into `error` envelopes.
+  `assistant/message` text into `assistant_message` envelopes. Local image
+  references shown in assistant markdown and files from `deliverables/presented`
+  are forwarded as base64 `{ media_type, name?, data }` members; successfully
+  forwarded markdown references are removed from text. The projector reads only
+  through DSH's filesystem service, accepts PNG/JPEG/WebP/GIF by magic bytes,
+  caps each file at 10,485,760 bytes, and forwards each canonical path once per
+  session turn. Remote `http`/`https`/`data`/`dsh-app` destinations and markdown
+  code spans/fenced blocks are untouched. By default a canonical path must be
+  within the canonical session cwd or OS temporary directory (including after
+  symlink resolution); set `outboundImagesOutsideCwd: true` only to permit any
+  readable image. Failed/missing/non-image/oversize files leave markdown intact.
+  Assistant image blocks remain supported for forward compatibility; `turn/end`
+  error reasons + live `agent/error` become `error` envelopes.
 
 It does **not** call an LLM directly, does **not** implement an agent loop, and
 imports no concrete loop classes. It drives only the public Harness abstractions
@@ -42,7 +56,7 @@ Modules under `src/` are layered, one responsibility each:
   with binding-consistency enforcement, `new_session` rebinding, and `renew`
   (fresh session + rebind, with no turn). `resume` restores persisted model and
   preset configuration. A persisted session whose header lacks a `cwd` is never
-  resumed: it is replaced by a fresh session (with `meta.cwd`) on the next
+  resumed: it is replaced by a fresh session (with `header.cwd`) on the next
   inbound message.
 - `inbound-adapter/` — the consumer: parse → idempotency → resolve →
   followup/steer/new_session → XACK.
@@ -107,6 +121,7 @@ plugin config). All keys are optional and have defaults:
 | `receiptKeyPrefix` | `harness-redis-connector:receipt` | Key prefix for receipt keys |
 | `commandResultKeyPrefix` | `harness-redis-connector:command-result` | Key prefix for durable system-command results |
 | `provider` / `model` | — | Fallback options for created/resumed agents when no persisted source configuration can be read |
+| `outboundImagesOutsideCwd` | `false` | Permit outbound images outside the session cwd and OS temporary directory |
 
 Environment variable supported as a convenience fallback: `REDIS_URL` (used only
 when `config.redisUrl` is absent).
@@ -116,13 +131,19 @@ when `config.redisUrl` is absent).
 - Inbound `type`: `message` | `new_session` | `steer` | `question_answer` |
   `system_command`; outbound `type`: `assistant_message` | `error` |
   `question_request` | `system_command_result`.
+- Inbound `message`/`steer` `content` carries `text` plus optional ordered
+  `images` (`media_type`, canonical base64 `data`, optional `name`/dimensions).
+  Empty `text` is valid only when at least one image is present.
 - `system_command { command: "renew_session" }` creates and binds a fresh
   initialized session without calling `followup`/`steer` or invoking an LLM. The
   replacement inherits the source session's `provider`/`model`/`maxTokens`/`cwd`/
   agent preset, is titled `bot-<botId>`, and is attached to the workspace
   matching its `cwd`. Its stored result is replayed across duplicate delivery;
   see `PROTOCOL.md` for the failure and redelivery contract.
-- Envelope fields are `snake_case`; `content` and `metadata` are objects.
+- Envelope fields are `snake_case`; `metadata` is an object. Outbound
+  `assistant_message` keeps `content_type: text/markdown`; text-only payloads
+  preserve the historical plain-string `content` shape, and image-bearing
+  payloads use object-shaped `content` with `text` and `images`.
 - `message_id` is the external idempotency key; `correlation_id` on outbound is
   the originating inbound `message_id`.
 - Each stream entry carries the JSON envelope as its single `json` field (the

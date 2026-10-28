@@ -5,6 +5,7 @@ import { InMemoryReceiptStore } from '../src/receipt-store/index.js'
 import { InMemoryCommandResultStore } from '../src/command-result-store/index.js'
 import { BindingConflictError, SessionResolver, type AgentHandleLike, type ResolvedAgent, type SessionResolverLike } from '../src/session-resolver/index.js'
 import { InMemoryConversationState } from '../src/state/conversation-state.js'
+import type { InboundContentMessage } from '../src/protocol/index.js'
 import type { StreamEntry } from '../src/redis-transport/types.js'
 import { FakeAgent, FakeAgentRegistry, FakeRedisTransport } from './helpers/fakes.js'
 
@@ -46,7 +47,7 @@ function setup() {
     bindings,
     state,
     ownedHandles,
-    createUserMessage: text => ({ id: `msg-${next}`, text }),
+    buildUserMessage: async (_agent, content) => ({ id: `msg-${next}`, text: content.text }),
     logger,
     inboundStream: 'harness:inbound',
     consumerGroup: 'g',
@@ -69,6 +70,49 @@ describe('inbound adapter', () => {
     expect((agent?.followups[0] as { text: string }).text).toBe('hello')
     expect(transport.acked).toHaveLength(1)
     expect(transport.acked[0]?.ids).toContain('1-m1')
+  })
+
+  it('passes text and images to the async message builder once', async () => {
+    const transport = new FakeRedisTransport()
+    const bindings = new InMemoryConversationBindingStore()
+    const receipts = new InMemoryReceiptStore({ ttlMs: 60_000 })
+    const resultStore = new InMemoryCommandResultStore()
+    const state = new InMemoryConversationState()
+    const agents = new FakeAgentRegistry()
+    const resolver = new SessionResolver({ agents, bindings, freshSessionId: () => 'session-1' })
+    const seen: InboundContentMessage[] = []
+    const adapter = new InboundAdapter({
+      transport,
+      resolver,
+      receipts,
+      resultStore,
+      bindings,
+      state,
+      ownedHandles: new Set<AgentHandleLike>(),
+      buildUserMessage: async (_agent, content) => {
+        seen.push(content)
+        return { id: 'msg-1', text: content.text }
+      },
+      logger: { warn: () => {}, error: () => {}, info: () => {} },
+      inboundStream: 'harness:inbound',
+      consumerGroup: 'g',
+      consumerName: 'c',
+      emitOutbound: async () => {},
+      commandResultTtlSeconds: 60,
+    })
+
+    await adapter.processEntry(makeEntry('m-images', {
+      content: {
+        text: '',
+        images: [{ media_type: 'image/png', data: 'iVBORw0KGgo=', name: 'sample.png' }],
+      },
+    }))
+
+    expect(seen).toHaveLength(1)
+    expect(seen[0]).toEqual({
+      text: '',
+      images: [{ media_type: 'image/png', data: 'iVBORw0KGgo=', name: 'sample.png' }],
+    })
   })
 
   it('reads the json field, falling back to the first field value when absent', async () => {
@@ -249,7 +293,7 @@ describe('inbound adapter', () => {
       bindings: new InMemoryConversationBindingStore(),
       state: new InMemoryConversationState(),
       ownedHandles: new Set(),
-      createUserMessage: () => ({ id: 'msg-1' }),
+      buildUserMessage: async () => ({ id: 'msg-1' }),
       logger: { warn: () => {}, error: () => {}, info: () => {} },
       inboundStream: 'harness:inbound',
       consumerGroup: 'g',
@@ -277,7 +321,7 @@ describe('inbound adapter', () => {
       bindings: new InMemoryConversationBindingStore(),
       state: new InMemoryConversationState(),
       ownedHandles: new Set(),
-      createUserMessage: () => ({ id: 'msg-1' }),
+      buildUserMessage: async () => ({ id: 'msg-1' }),
       logger: { warn: () => {}, error: () => {}, info: () => {} },
       inboundStream: 'harness:inbound',
       consumerGroup: 'g',
@@ -291,6 +335,36 @@ describe('inbound adapter', () => {
     expect(outcome.admitted).toBe(false)
     expect(outcome.acked).toBe(false)
     expect(transport.acked).toHaveLength(0)
+  })
+
+  it('ACKs and skips followup when the message builder rejects the inbound payload', async () => {
+    const transport = new FakeRedisTransport()
+    const agents = new FakeAgentRegistry()
+    const blocking = new InboundAdapter({
+      transport,
+      resolver: new SessionResolver({
+        agents,
+        bindings: new InMemoryConversationBindingStore(),
+        freshSessionId: () => 'session-1',
+      }),
+      receipts: new InMemoryReceiptStore({ ttlMs: 60_000 }),
+      resultStore: new InMemoryCommandResultStore(),
+      bindings: new InMemoryConversationBindingStore(),
+      state: new InMemoryConversationState(),
+      ownedHandles: new Set(),
+      buildUserMessage: async () => undefined,
+      logger: { warn: () => {}, error: () => {}, info: () => {} },
+      inboundStream: 'harness:inbound',
+      consumerGroup: 'g',
+      consumerName: 'c',
+      emitOutbound: async () => {},
+      commandResultTtlSeconds: 60,
+    })
+    const outcome = await blocking.processEntry(makeEntry('m-block'))
+    expect(outcome.acked).toBe(true)
+    expect(outcome.admitted).toBe(false)
+    expect(transport.acked).toHaveLength(1)
+    expect(agents.live.get('session-1')?.followups ?? []).toHaveLength(0)
   })
 
   it('ACKs a binding conflict (permanent hard-reject)', async () => {
@@ -307,7 +381,7 @@ describe('inbound adapter', () => {
       bindings: new InMemoryConversationBindingStore(),
       state: new InMemoryConversationState(),
       ownedHandles: new Set(),
-      createUserMessage: () => ({ id: 'msg-1' }),
+      buildUserMessage: async () => ({ id: 'msg-1' }),
       logger: { warn: () => {}, error: () => {}, info: () => {} },
       inboundStream: 'harness:inbound',
       consumerGroup: 'g',

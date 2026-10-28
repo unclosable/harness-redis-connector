@@ -32,7 +32,7 @@ describe('session resolver', () => {
 
   it('resumes a persisted but not-live session (owned)', async () => {
     const { agents, bindings, resolver } = setup({
-      persistence: new FakeSessionPersistence([{ id: 'session-old', cwd: '/work/session-old' }]),
+      persistence: new FakeSessionPersistence([{ header: { id: 'session-old', cwd: '/work/session-old' } }]),
     })
     await bindings.bind('telegram:chat:1', 'session-old')
 
@@ -47,7 +47,7 @@ describe('session resolver', () => {
 
   it('does not resume a persisted session lacking a cwd header — creates a fresh session and rebinds', async () => {
     const { agents, bindings, resolver } = setup({
-      persistence: new FakeSessionPersistence([{ id: 'session-old' }]),
+      persistence: new FakeSessionPersistence([{ header: { id: 'session-old' } }]),
     })
     await bindings.bind('telegram:chat:1', 'session-old')
 

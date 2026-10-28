@@ -117,9 +117,9 @@ export class FakeAgentRegistry implements AgentRegistryLike {
 
 /** An in-memory {@link SessionPersistenceLike} fake. */
 export class FakeSessionPersistence implements SessionPersistenceLike {
-  constructor(public readonly headers: Array<{ id: string; cwd?: string }> = []) {}
+  constructor(public readonly snapshots: Array<{ header: { id: string; cwd?: string } }> = []) {}
 
-  async list(): Promise<Array<{ id: string; cwd?: string }>> {
-    return this.headers
+  async list(): Promise<Array<{ header: { id: string; cwd?: string } }>> {
+    return this.snapshots
   }
 }

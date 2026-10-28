@@ -5,6 +5,7 @@
 
 /** The logger surface the connector modules need (satisfied by `ctx.logger`). */
 export interface LoggerLike {
+  debug?(...args: unknown[]): void
   warn(...args: unknown[]): void
   error(...args: unknown[]): void
   info(...args: unknown[]): void

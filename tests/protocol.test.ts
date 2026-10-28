@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest'
+import { Buffer } from 'node:buffer'
 import { parseInboundEnvelope, serializeOutboundEnvelope, type OutboundEnvelope } from '../src/protocol/index.js'
 
 function inbound(overrides: Record<string, unknown> = {}): string {
@@ -48,6 +49,61 @@ describe('protocol validation', () => {
 
   it('rejects a non-string content.text', () => {
     expect(parseInboundEnvelope(inbound({ content: { text: 42 } })).kind).toBe('error')
+  })
+
+  it('accepts inbound images and allows empty text when images are present', () => {
+    const result = parseInboundEnvelope(inbound({
+      content: {
+        text: '',
+        images: [{ media_type: 'image/jpeg', data: '/9j/', name: 'photo.jpg', width: 1280, height: 960 }],
+      },
+    }))
+    expect(result.kind).toBe('ok')
+    if (result.kind === 'ok') {
+      expect(result.envelope.content).toEqual({
+        text: '',
+        images: [{ media_type: 'image/jpeg', data: '/9j/', name: 'photo.jpg', width: 1280, height: 960 }],
+      })
+    }
+  })
+
+  it('rejects empty text when images are missing', () => {
+    const result = parseInboundEnvelope(inbound({ content: { text: '' } }))
+    expect(result.kind).toBe('error')
+    if (result.kind === 'error') {
+      expect(result.reason).toContain('content.text must be non-empty')
+    }
+  })
+
+  it('rejects inbound images with unsupported media types', () => {
+    const result = parseInboundEnvelope(inbound({
+      content: {
+        text: '',
+        images: [{ media_type: 'image/heic', data: '/9j/' }],
+      },
+    }))
+    expect(result.kind).toBe('error')
+  })
+
+  it('rejects inbound images with malformed base64 data', () => {
+    const result = parseInboundEnvelope(inbound({
+      content: {
+        text: 'look',
+        images: [{ media_type: 'image/png', data: 'not-base64@@@' }],
+      },
+    }))
+    expect(result.kind).toBe('error')
+  })
+
+  it('rejects inbound images that exceed the decoded size limit', () => {
+    const tooLargeBase64 = Buffer.alloc((20 * 1024 * 1024) + 1, 0).toString('base64')
+    const result = parseInboundEnvelope(inbound({
+      content: {
+        text: '',
+        images: [{ media_type: 'image/png', data: tooLargeBase64 }],
+      },
+    }))
+    expect(result.kind).toBe('error')
   })
 
   it('safe-ignores an unknown type (forward compatibility)', () => {
